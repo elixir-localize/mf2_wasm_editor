@@ -1,0 +1,13 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+.DS_Store
+
+# Scratch outputs from the sync task. The committed artefacts live
+# under priv/static/ and priv/grammar/; local/temporary files must
+# not leak into the package.
+/tmp/

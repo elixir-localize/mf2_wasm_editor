@@ -1,0 +1,42 @@
+{
+  "name": "tree-sitter-mf2",
+  "version": "0.1.0",
+  "description": "tree-sitter grammar for ICU MessageFormat 2.0 (MF2) messages",
+  "main": "bindings/node",
+  "keywords": [
+    "parser",
+    "lexer",
+    "tree-sitter",
+    "mf2",
+    "messageformat",
+    "icu",
+    "l10n",
+    "i18n"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/elixir-localize/localize.git",
+    "directory": "tree-sitter-mf2"
+  },
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test",
+    "parse": "tree-sitter parse"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.0.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.24.0"
+  },
+  "peerDependencies": {
+    "tree-sitter": "^0.24.0"
+  },
+  "peerDependenciesMeta": {
+    "tree-sitter": {
+      "optional": true
+    }
+  }
+}

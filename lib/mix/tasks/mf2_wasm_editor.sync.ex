@@ -1,53 +1,56 @@
-defmodule Mix.Tasks.LocalizeMf2Editor.Sync do
+defmodule Mix.Tasks.Mf2WasmEditor.Sync do
   @moduledoc """
-  Sync the vendored grammar + queries from the `mf2_editor_extensions`
-  sibling repo, and optionally rebuild `tree-sitter-mf2.wasm`.
+  Sync the vendored grammar + WASM + queries from the
+  [`mf2_treesitter`](https://github.com/elixir-localize/mf2_treesitter)
+  repo.
 
-  This package embeds the MF2 grammar as three parallel artefacts:
+  This package embeds the MF2 grammar as browser-facing artefacts:
 
-    * Source and generated parser (`priv/grammar/`) — `parser.c`,
-      `grammar.json`, `node-types.json`, plus `grammar.js` for
-      reference. Used to regenerate the WASM from scratch.
+    * **WASM** (`priv/static/tree-sitter-mf2.wasm`) — what the
+      `web-tree-sitter` runtime actually loads.
 
-    * Highlight and injection queries (`priv/queries/`) — the two
-      `.scm` files consumed by the browser-side `web-tree-sitter`
-      loader at runtime.
+    * **Queries** (`priv/static/highlights.scm`, `injections.scm`)
+      — fetched at runtime by the JS hook.
 
-    * The compiled WASM (`priv/static/tree-sitter-mf2.wasm`) — the
-      artefact browsers load.
+    * **Grammar source** (`priv/grammar/`) — parser.c, parser.h,
+      grammar.json, node-types.json, grammar.js. Kept alongside as
+      reference so the WASM can be regenerated locally if needed.
 
-  The canonical source of all three lives in
-  `mf2_editor_extensions/tree-sitter-mf2/`. This task keeps our
-  vendored copy in step.
+  The canonical source for all three lives in `mf2_treesitter`.
+  This task keeps our vendored copy in step.
 
   ## Usage
 
-      # Copy sources + queries from the sibling repo.
-      mix localize_mf2_editor.sync
+      # Copy sources + queries + WASM from the sibling mf2_treesitter.
+      mix mf2_wasm_editor.sync
 
       # Fail (exit 1) if anything has drifted; do not modify files.
       # Intended for CI.
-      mix localize_mf2_editor.sync --check
+      mix mf2_wasm_editor.sync --check
 
-      # Additionally rebuild priv/static/tree-sitter-mf2.wasm.
-      # Requires either emcc, docker, or podman on PATH. Uses the
-      # tree-sitter CLI under node_modules/.bin of the source repo.
-      mix localize_mf2_editor.sync --build-wasm
+      # Additionally rebuild priv/static/tree-sitter-mf2.wasm from
+      # the vendored grammar (rather than just copying the grammar
+      # repo's prebuilt .wasm). Requires emcc, docker, or podman on
+      # PATH; uses the tree-sitter CLI under node_modules/.bin of
+      # mf2_treesitter.
+      mix mf2_wasm_editor.sync --build-wasm
 
   ## Locating the grammar repo
 
-  The task looks for the grammar at `../mf2_editor_extensions/tree-sitter-mf2`
-  relative to this package. Override with `MF2_GRAMMAR_DIR`:
+  The task looks for `mf2_treesitter` at `../mf2_treesitter` relative
+  to this package. Override with `MF2_TREESITTER_DIR`:
 
-      MF2_GRAMMAR_DIR=/path/to/tree-sitter-mf2 mix localize_mf2_editor.sync
+      MF2_TREESITTER_DIR=/path/to/mf2_treesitter mix mf2_wasm_editor.sync
   """
   use Mix.Task
 
-  @shortdoc "Sync the vendored tree-sitter-mf2 grammar sources and queries."
+  @shortdoc "Sync the vendored tree-sitter-mf2 grammar + WASM + queries from mf2_treesitter."
 
+  # Files to sync from mf2_treesitter. Each tuple is `{source_rel, dest_rel}`
+  # — source relative to the mf2_treesitter repo root, dest relative to
+  # this package's priv/ directory.
   @grammar_files [
     {"grammar.js", "grammar/grammar.js"},
-    {"package.json", "grammar/package.json"},
     {"src/grammar.json", "grammar/src/grammar.json"},
     {"src/node-types.json", "grammar/src/node-types.json"},
     {"src/parser.c", "grammar/src/parser.c"},
@@ -55,11 +58,15 @@ defmodule Mix.Tasks.LocalizeMf2Editor.Sync do
   ]
 
   @query_files [
-    {"queries/highlights.scm", "static/highlights.scm"},
-    {"queries/injections.scm", "static/injections.scm"}
+    {"queries/highlights.scm", "static/highlights.scm"}
   ]
 
-  @wasm_output "static/tree-sitter-mf2.wasm"
+  @wasm_files [
+    # mf2_treesitter ships a prebuilt .wasm; copy it verbatim into
+    # priv/static/ so we don't need emscripten/docker on consumers'
+    # machines. Override via --build-wasm.
+    {"wasm/tree-sitter-mf2.wasm", "static/tree-sitter-mf2.wasm"}
+  ]
 
   @switches [check: :boolean, build_wasm: :boolean]
 
@@ -76,9 +83,14 @@ defmodule Mix.Tasks.LocalizeMf2Editor.Sync do
     Mix.shell().info("[sync] grammar source: #{grammar_dir}")
     Mix.shell().info("[sync] package priv:   #{priv_dir}")
 
-    drift =
-      sync_files(grammar_dir, priv_dir, @grammar_files, check?) ++
-        sync_files(grammar_dir, priv_dir, @query_files, check?)
+    files_to_sync = @grammar_files ++ @query_files
+
+    # When --build-wasm is passed we rebuild locally instead of
+    # copying the prebuilt WASM, so skip the WASM copy in that path.
+    files_to_sync =
+      if build_wasm?, do: files_to_sync, else: files_to_sync ++ @wasm_files
+
+    drift = sync_files(grammar_dir, priv_dir, files_to_sync, check?)
 
     cond do
       check? and drift != [] ->
@@ -88,7 +100,7 @@ defmodule Mix.Tasks.LocalizeMf2Editor.Sync do
           Mix.shell().error("  - #{path}")
         end)
 
-        Mix.shell().error("Run `mix localize_mf2_editor.sync` to update.")
+        Mix.shell().error("Run `mix mf2_wasm_editor.sync` to update.")
         exit({:shutdown, 1})
 
       check? ->
@@ -147,15 +159,15 @@ defmodule Mix.Tasks.LocalizeMf2Editor.Sync do
       Could not find tree-sitter CLI at #{tree_sitter_bin}.
 
       Run `npm install` inside #{grammar_dir} first, or set
-      MF2_GRAMMAR_DIR to a grammar checkout where dependencies are
+      MF2_TREESITTER_DIR to a grammar checkout where dependencies are
       installed.
       """)
     end
 
-    output_path = Path.join(priv_dir, @wasm_output)
+    output_path = Path.join(priv_dir, "static/tree-sitter-mf2.wasm")
     File.mkdir_p!(Path.dirname(output_path))
 
-    Mix.shell().info("[sync] building #{@wasm_output}")
+    Mix.shell().info("[sync] building tree-sitter-mf2.wasm from #{grammar_dir}")
     Mix.shell().info("[sync] (requires emcc, docker, or podman on PATH)")
 
     {output, status} =
@@ -173,24 +185,20 @@ defmodule Mix.Tasks.LocalizeMf2Editor.Sync do
   end
 
   defp grammar_dir! do
-    override = System.get_env("MF2_GRAMMAR_DIR")
+    override = System.get_env("MF2_TREESITTER_DIR")
 
     path =
       cond do
-        is_binary(override) and override != "" ->
-          override
-
-        true ->
-          Path.expand("../mf2_editor_extensions/tree-sitter-mf2", File.cwd!())
+        is_binary(override) and override != "" -> override
+        true -> Path.expand("../mf2_treesitter", File.cwd!())
       end
 
     unless File.dir?(path) do
       Mix.raise("""
-      grammar source not found at: #{path}
+      mf2_treesitter not found at: #{path}
 
-      Set MF2_GRAMMAR_DIR to the tree-sitter-mf2 directory of
-      `mf2_editor_extensions`, or check out that repo as a sibling
-      of this package.
+      Set MF2_TREESITTER_DIR to the mf2_treesitter repo, or check
+      it out as a sibling of this package.
       """)
     end
 

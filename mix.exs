@@ -1,14 +1,14 @@
-defmodule LocalizeMf2Editor.MixProject do
+defmodule Mf2WasmEditor.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/elixir-localize/localize_mf2_editor"
+  @source_url "https://github.com/elixir-localize/mf2_wasm_editor"
 
   def project do
     [
-      app: :localize_mf2_editor,
+      app: :mf2_wasm_editor,
       version: @version,
-      name: "Localize MF2 Editor",
+      name: "MF2 WASM Editor",
       source_url: @source_url,
       description: description(),
       package: package(),
@@ -27,10 +27,10 @@ defmodule LocalizeMf2Editor.MixProject do
   end
 
   defp description do
-    "Browser-side MF2 syntax highlighter. Ships a prebuilt " <>
-      "web-tree-sitter bundle and the compiled tree-sitter-mf2 grammar " <>
-      "WASM, plus a Phoenix LiveView hook. Consumers drop a script tag " <>
-      "and a textarea-over-pre widget; no per-keystroke server round trip."
+    "Browser-side MF2 syntax highlighter + Phoenix LiveView hook. " <>
+      "Ships a prebuilt web-tree-sitter bundle and the tree-sitter-mf2 " <>
+      "grammar compiled to WASM. Consumers drop a script tag and a " <>
+      "textarea-over-pre widget — no per-keystroke server round trip."
   end
 
   defp package do

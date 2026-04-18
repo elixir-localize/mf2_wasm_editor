@@ -1,4 +1,4 @@
-defmodule LocalizeMf2Editor do
+defmodule Mf2WasmEditor do
   @moduledoc """
   Browser-side MF2 syntax highlighter for Phoenix LiveView apps.
 
@@ -21,21 +21,20 @@ defmodule LocalizeMf2Editor do
       # endpoint.ex
       plug Plug.Static,
         at: "/mf2_editor",
-        from: {:localize_mf2_editor, "priv/static"},
+        from: {:mf2_wasm_editor, "priv/static"},
         gzip: false,
-        only: ~w(tree-sitter.js tree-sitter.wasm tree-sitter-mf2.wasm
-                 mf2_editor.js highlights.scm injections.scm)
+        only: Mf2WasmEditor.static_paths()
 
       # root layout (HEEx)
-      <%= raw LocalizeMf2Editor.script_tags() %>
+      {raw(Mf2WasmEditor.script_tags())}
 
       # app.js
-      const Hooks = Object.assign({}, window.LocalizeMf2Editor.Hooks)
+      const Hooks = Object.assign({}, window.Mf2WasmEditor?.Hooks || {})
       new LiveSocket("/live", Socket, {hooks: Hooks, params: {...}})
 
       # any LiveView template
       <div phx-hook="MF2Editor" id="my-editor">
-        <pre aria-hidden="true"><code></code></pre>
+        <pre aria-hidden="true" phx-update="ignore"><code></code></pre>
         <textarea name="message" phx-update="ignore"></textarea>
       </div>
 
@@ -61,11 +60,11 @@ defmodule LocalizeMf2Editor do
 
   ### Examples
 
-      iex> LocalizeMf2Editor.script_tags()
+      iex> Mf2WasmEditor.script_tags()
       ~s(<script src="/mf2_editor/tree-sitter.js" defer></script>\\n) <>
         ~s(<script src="/mf2_editor/mf2_editor.js" defer></script>)
 
-      iex> LocalizeMf2Editor.script_tags(base_url: "/assets/mf2")
+      iex> Mf2WasmEditor.script_tags(base_url: "/assets/mf2")
       ~s(<script src="/assets/mf2/tree-sitter.js" defer></script>\\n) <>
         ~s(<script src="/assets/mf2/mf2_editor.js" defer></script>)
 
@@ -85,14 +84,14 @@ defmodule LocalizeMf2Editor do
 
   ### Examples
 
-      iex> LocalizeMf2Editor.static_paths()
-      ["highlights.scm", "injections.scm", "mf2_editor.js",
-       "tree-sitter-mf2.wasm", "tree-sitter.js", "tree-sitter.wasm"]
+      iex> Mf2WasmEditor.static_paths()
+      ["highlights.scm", "mf2_editor.js", "tree-sitter-mf2.wasm",
+       "tree-sitter.js", "tree-sitter.wasm"]
 
   """
   @spec static_paths() :: [String.t()]
   def static_paths do
-    ~w(highlights.scm injections.scm mf2_editor.js
-       tree-sitter-mf2.wasm tree-sitter.js tree-sitter.wasm)
+    ~w(highlights.scm mf2_editor.js tree-sitter-mf2.wasm
+       tree-sitter.js tree-sitter.wasm)
   end
 end

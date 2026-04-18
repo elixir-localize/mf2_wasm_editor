@@ -1,10 +1,25 @@
-# Localize MF2 Editor
+# mf2_wasm_editor
 
 Browser-side syntax highlighter for [ICU MessageFormat 2.0](https://unicode.org/reports/tr35/tr35-messageFormat.html) (MF2) messages. Drop-in [Phoenix LiveView](https://github.com/phoenixframework/phoenix_live_view) hook.
 
-The hook runs the [`tree-sitter-mf2`](https://github.com/elixir-localize/mf2_editor_extensions/tree/main/tree-sitter-mf2) grammar directly in the browser via [`web-tree-sitter`](https://github.com/tree-sitter/tree-sitter/tree/master/lib/binding_web). Keystrokes are highlighted and diagnostics surface without leaving the client — no server round trip per edit. The server stays in the loop only for authoritative operations (e.g. `Localize.Message.format/3`, persistence) that it actually owns.
+The hook runs the [`mf2_treesitter`](https://github.com/elixir-localize/mf2_treesitter) grammar directly in the browser via [`web-tree-sitter`](https://github.com/tree-sitter/tree-sitter/tree/master/lib/binding_web). Keystrokes are highlighted and diagnostics surface without leaving the client — no server round trip per edit. The server stays in the loop only for authoritative operations (formatting, validation, persistence) that it actually owns.
 
-> Not the same package as `localize_mf2_treesitter_server`. That one is server-side Elixir bindings — a NIF over the same grammar, useful for LSP servers, build-time validation, and SSR. This one is the browser runtime and LiveView hook. The two can coexist in the same app (the playground uses both); they share the grammar repo but not any runtime code.
+## Package scope, next time I come back here
+
+This package ships three browser-side artefacts plus the Elixir glue to serve them:
+
+1. **Web-tree-sitter runtime** (`tree-sitter.js`, `tree-sitter.wasm`) — vendored from the `web-tree-sitter` npm package, MIT-licensed.
+2. **Compiled MF2 grammar** (`tree-sitter-mf2.wasm`) — vendored from [`mf2_treesitter`](https://github.com/elixir-localize/mf2_treesitter); regeneratable locally via the `--build-wasm` flag on the sync task.
+3. **LiveView hook** (`mf2_editor.js`) — homegrown; the non-trivial piece. Handles parsing, highlighting, diagnostics, auto-close, bracket matching, tooltip display, and server-push text replacement.
+
+Not in this package (so I don't get confused next time):
+
+* **The grammar itself** — that's [`mf2_treesitter`](https://github.com/elixir-localize/mf2_treesitter).
+* **Server-side MF2 parsing in Elixir** — that's [`localize_mf2_treesitter`](https://github.com/elixir-localize/localize_mf2_treesitter) (NIF).
+* **Editor extensions** (Zed, Helix, Neovim, VS Code, Emacs, Vim) — that's [`mf2_editor_extensions`](https://github.com/elixir-localize/mf2_editor_extensions).
+* **The Localize hex package** itself — this editor doesn't depend on Localize. The playground that consumes it happens to use Localize for server-side formatting, but `mf2_wasm_editor` doesn't know or care.
+
+The `mf2_` prefix (no `localize_`) signals ecosystem-neutrality: this editor works for any Phoenix LiveView app editing MF2 messages, not only Localize-flavoured ones.
 
 ---
 
@@ -32,19 +47,19 @@ Everything sits under `priv/static/` (so a single `Plug.Static` declaration expo
 | `tree-sitter-mf2.wasm` | ~23 KB | MF2 grammar compiled to WASM (Apache-2.0). Loaded by the hook. |
 | `highlights.scm` | small | Capture query for syntax highlighting (vendored from the grammar repo). |
 | `injections.scm` | small | Injection hints (currently unused by the hook but shipped for completeness). |
-| `mf2_editor.js` | ~10 KB | The LiveView hook. Registers `window.LocalizeMf2Editor.Hooks.MF2Editor`. |
+| `mf2_editor.js` | ~10 KB | The LiveView hook. Registers `window.Mf2WasmEditor.Hooks.MF2Editor`. |
 
 Plus under `priv/grammar/` — the grammar source used by the `--build-wasm` sync task — and in the package's `lib/`, the Elixir helpers:
 
-* `LocalizeMf2Editor.script_tags/1` — emits the two `<script>` tags.
-* `LocalizeMf2Editor.static_paths/0` — the file list for `Plug.Static`'s `:only` option.
+* `Mf2WasmEditor.script_tags/1` — emits the two `<script>` tags.
+* `Mf2WasmEditor.static_paths/0` — the file list for `Plug.Static`'s `:only` option.
 
 ## Installation
 
 ```elixir
 def deps do
   [
-    {:localize_mf2_editor, "~> 0.1"}
+    {:mf2_wasm_editor, "~> 0.1"}
   ]
 end
 ```
@@ -61,9 +76,9 @@ Four pieces need to line up. Each has at least one thing that will silently brea
 # endpoint.ex
 plug Plug.Static,
   at: "/mf2_editor",
-  from: {:localize_mf2_editor, "priv/static"},
+  from: {:mf2_wasm_editor, "priv/static"},
   gzip: false,
-  only: LocalizeMf2Editor.static_paths()
+  only: Mf2WasmEditor.static_paths()
 ```
 
 The `:at` path is arbitrary but **must match the `base_url` option of `script_tags/1`** (see next step) and the path the hook fetches from at runtime. `/mf2_editor` is the default in both. If you need a different prefix (e.g. to route under an existing `/assets` mount), pass it to `script_tags/1` too.
@@ -75,19 +90,19 @@ The `:only` option scopes `Plug.Static` to the six files the hook needs; nothing
 ```heex
 <link phx-track-static rel="stylesheet" href="/assets/app.css" />
 <%!-- MF2 editor scripts MUST appear before app.js (see below). --%>
-{raw(LocalizeMf2Editor.script_tags())}
+{raw(Mf2WasmEditor.script_tags())}
 <script defer phx-track-static type="text/javascript" src="/assets/app.js"></script>
 ```
 
-**`script_tags/1` must come before `app.js` in the document.** Both sets of scripts use `defer`, which runs them in document order after parsing finishes. `app.js` constructs the `LiveSocket` and reads `window.LocalizeMf2Editor.Hooks.MF2Editor` at that moment — so the MF2 scripts must have executed first and populated the namespace. Put them after `app.js` and the hook is silently unregistered; the editor mounts with no hook bound and you get the full **cursor moves but nothing highlights** failure mode. This is a very easy mistake to make; there is no runtime error.
+**`script_tags/1` must come before `app.js` in the document.** Both sets of scripts use `defer`, which runs them in document order after parsing finishes. `app.js` constructs the `LiveSocket` and reads `window.Mf2WasmEditor.Hooks.MF2Editor` at that moment — so the MF2 scripts must have executed first and populated the namespace. Put them after `app.js` and the hook is silently unregistered; the editor mounts with no hook bound and you get the full **cursor moves but nothing highlights** failure mode. This is a very easy mistake to make; there is no runtime error.
 
 If you pass a custom base URL:
 
 ```heex
-{raw(LocalizeMf2Editor.script_tags(base_url: "/assets/mf2"))}
+{raw(Mf2WasmEditor.script_tags(base_url: "/assets/mf2"))}
 ```
 
-The hook's runtime asset fetches (`tree-sitter.wasm`, `tree-sitter-mf2.wasm`, `highlights.scm`) are derived from the same base URL via `window.LocalizeMf2Editor.baseUrl` (set by the `<script>` preamble) or a `data-mf2-base-url` attribute on the hook element.
+The hook's runtime asset fetches (`tree-sitter.wasm`, `tree-sitter-mf2.wasm`, `highlights.scm`) are derived from the same base URL via `window.Mf2WasmEditor.baseUrl` (set by the `<script>` preamble) or a `data-mf2-base-url` attribute on the hook element.
 
 ### 3. Merge the hook into your `LiveSocket`
 
@@ -97,8 +112,8 @@ const Hooks = {}
 // ...your other hooks...
 
 // Merge the MF2 editor hook in. It registers onto
-// `window.LocalizeMf2Editor.Hooks` from mf2_editor.js.
-const AllHooks = Object.assign({}, Hooks, window.LocalizeMf2Editor?.Hooks || {})
+// `window.Mf2WasmEditor.Hooks` from mf2_editor.js.
+const AllHooks = Object.assign({}, Hooks, window.Mf2WasmEditor?.Hooks || {})
 
 const liveSocket = new LiveSocket("/live", Socket, {
   hooks: AllHooks,
@@ -332,18 +347,18 @@ The playground does not do this — it prefers to parse on the server via `local
 
 ## Grammar currency
 
-The grammar sources, highlight query, and compiled WASM are vendored from [`mf2_editor_extensions/tree-sitter-mf2`](https://github.com/elixir-localize/mf2_editor_extensions/tree/main/tree-sitter-mf2). The `mix localize_mf2_editor.sync` task keeps them in step:
+The grammar sources, highlight query, and compiled WASM are vendored from [`mf2_treesitter`](https://github.com/elixir-localize/mf2_treesitter). The `mix mf2_wasm_editor.sync` task keeps them in step:
 
 ```bash
 # Copy sources + queries from the sibling repo.
-mix localize_mf2_editor.sync
+mix mf2_wasm_editor.sync
 
 # CI check — exit non-zero if vendored files drift from the grammar repo.
-mix localize_mf2_editor.sync --check
+mix mf2_wasm_editor.sync --check
 
 # Rebuild priv/static/tree-sitter-mf2.wasm from priv/grammar/ via the
 # tree-sitter CLI + emscripten (or docker/podman).
-mix localize_mf2_editor.sync --build-wasm
+mix mf2_wasm_editor.sync --build-wasm
 ```
 
 The sync task looks for the grammar at `../mf2_editor_extensions/tree-sitter-mf2` by default; override with `MF2_GRAMMAR_DIR=/path`.

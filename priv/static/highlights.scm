@@ -28,9 +28,13 @@
 ; ─── Literals ─────────────────────────────────────────────────────────
 (quoted_literal)  @string
 (quoted_char)     @string
-(quoted_escape)   @string.escape
-(number_literal)  @number
-(unquoted_literal (name) @string)
+(unquoted_literal) @string
+;
+; Numeric-looking unquoted literals get the @number capture via a
+; predicate. Consumers whose tree-sitter host doesn't honour #match?
+; will fall back to the plain @string capture above.
+((unquoted_literal) @number
+  (#match? @number "^-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?$"))
 
 ; ─── Escapes ──────────────────────────────────────────────────────────
 (escape)          @string.escape

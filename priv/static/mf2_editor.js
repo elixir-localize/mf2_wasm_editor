@@ -13,7 +13,7 @@
  *   <script src="/mf2_editor/tree-sitter.js"></script>
  *   <script src="/mf2_editor/mf2_editor.js"></script>
  *
- * After these load, `window.LocalizeMf2Editor.Hooks.MF2Editor` is the
+ * After these load, `window.Mf2WasmEditor.Hooks.MF2Editor` is the
  * LiveView hook. Merge it into your LiveSocket's `hooks` option.
  *
  * Expected DOM
@@ -32,7 +32,7 @@
  * --------
  *
  * All WASM / query assets are fetched from `/mf2_editor/` by default.
- * Override by setting `window.LocalizeMf2Editor.baseUrl = "..."`
+ * Override by setting `window.Mf2WasmEditor.baseUrl = "..."`
  * before this script loads, or via a `data-mf2-base-url="..."`
  * attribute on the hook element.
  */
@@ -40,7 +40,7 @@
 (function () {
   const DEFAULT_BASE_URL = "/mf2_editor";
 
-  const ns = (window.LocalizeMf2Editor = window.LocalizeMf2Editor || {});
+  const ns = (window.Mf2WasmEditor = window.Mf2WasmEditor || {});
   ns.baseUrl = ns.baseUrl || DEFAULT_BASE_URL;
 
   // ------------------------------------------------------------------
@@ -608,6 +608,483 @@
     return null;
   }
 
+  // ==================================================================
+  //                    IDE-STYLE FEATURE INFRASTRUCTURE
+  //
+  // Everything below is the shared machinery for the richer editing
+  // features layered on top of plain highlighting + diagnostics:
+  //
+  //   - Locals graph (definitions + references + scopes) from the CST.
+  //   - Tree navigation helpers (descendant-at-caret, parent chain).
+  //   - Caret → pixel coordinate mapping via a hidden mirror textarea.
+  //   - Generic floating-popup framework used by completion, outline,
+  //     hover, signature help.
+  //   - Static function registry (hardcoded for now; will be replaced
+  //     by a server push in a later pass).
+  //   - CLDR plural categories per locale, for `.match` skeletons.
+  //
+  // Feature handlers live inside the MF2Editor hook further down; they
+  // compose these primitives to implement goto-definition, rename,
+  // outline, completion, etc.
+  // ==================================================================
+
+  // ---- Locals graph -------------------------------------------------
+  //
+  // Walks the tree once per parse and produces:
+  //
+  //   scope           — the complex_message node, if any (null for
+  //                     simple messages; they have no declarations).
+  //   definitions     — Map<name, { node, nameNode, kind }>
+  //                     where kind is "input" | "local".
+  //   referencesByName— Map<name, Array<referenceNode>>
+  //                     (name of the variable → all name-node refs).
+  //   allReferences   — flat list of { name, node } for fast walks.
+  //
+  // A "reference" is any `(variable (name))` occurrence; a "definition"
+  // is the `(variable (name))` directly inside a `local_declaration`
+  // or an `input_declaration`'s `variable_expression`.
+
+  function buildLocalsGraph(rootNode) {
+    const graph = {
+      scope: null,
+      definitions: new Map(),
+      referencesByName: new Map(),
+      allReferences: [],
+    };
+
+    if (!rootNode) return graph;
+
+    // Find the complex_message (if any).
+    let complex = null;
+    walkTree(rootNode, (n) => {
+      if (n.type === "complex_message") {
+        complex = n;
+        return "stop";
+      }
+      return "continue";
+    });
+
+    graph.scope = complex;
+    const scopeRoot = complex || rootNode;
+
+    // Pass 1: find definitions. Only declarations in the complex_message
+    // (or its prelude) contribute — variables in expressions / patterns
+    // are references.
+    walkTree(scopeRoot, (n) => {
+      if (n.type === "local_declaration") {
+        const varNode = firstNamedChildOfType(n, "variable");
+        if (varNode) recordDefinition(graph, varNode, "local");
+        // Don't descend into the RHS expression — the `$x` in
+        // `.local $x = {$y}` is a *definition* for $x but `$y` is a
+        // *reference*. We recurse into children below, treating the
+        // variable under local_declaration as special-cased; the
+        // descent captures $y correctly.
+      } else if (n.type === "input_declaration") {
+        // .input {$x :f} — the $x directly inside the variable_expression
+        // is the definition. Other variables inside the same expression
+        // (options, etc.) would be references.
+        const varExpr = firstNamedChildOfType(n, "variable_expression");
+        if (varExpr) {
+          const varNode = firstNamedChildOfType(varExpr, "variable");
+          if (varNode) recordDefinition(graph, varNode, "input");
+        }
+      }
+      return "continue";
+    });
+
+    // Pass 2: find references. Every `variable` that isn't a
+    // definition is a reference. Because definitions are recorded with
+    // a unique identity (startIndex), we can dedupe.
+    const defIdents = new Set();
+    for (const def of graph.definitions.values()) {
+      defIdents.add(def.varNode.startIndex);
+    }
+
+    walkTree(scopeRoot, (n) => {
+      if (n.type === "variable") {
+        if (!defIdents.has(n.startIndex)) {
+          const nameNode = firstNamedChildOfType(n, "name");
+          if (nameNode) {
+            const name = textOf(nameNode);
+            const entry = { name, node: n, nameNode };
+            graph.allReferences.push(entry);
+            const list = graph.referencesByName.get(name) || [];
+            list.push(entry);
+            graph.referencesByName.set(name, list);
+          }
+        }
+      }
+      return "continue";
+    });
+
+    return graph;
+  }
+
+  function recordDefinition(graph, varNode, kind) {
+    const nameNode = firstNamedChildOfType(varNode, "name");
+    if (!nameNode) return;
+    const name = textOf(nameNode);
+    graph.definitions.set(name, { varNode, nameNode, kind, name });
+  }
+
+  // ---- Tree navigation helpers -------------------------------------
+
+  function walkTree(root, visitor) {
+    const cursor = root.walk();
+    try {
+      if (!cursor.gotoFirstChild()) {
+        visitor(root);
+        return;
+      }
+      // Revisit root first so pre-order invariants hold.
+      visitor(root);
+      let visiting = true;
+      while (visiting) {
+        const result = visitor(cursor.currentNode);
+        if (result === "stop") return;
+        if (cursor.gotoFirstChild()) continue;
+        while (!cursor.gotoNextSibling()) {
+          if (!cursor.gotoParent()) {
+            visiting = false;
+            break;
+          }
+        }
+      }
+    } finally {
+      cursor.delete();
+    }
+  }
+
+  function firstNamedChildOfType(node, type) {
+    for (const c of node.namedChildren) if (c.type === type) return c;
+    return null;
+  }
+
+  function textOf(node) {
+    return node.text !== undefined
+      ? node.text
+      : // Older web-tree-sitter versions may not expose `.text`; fall back to slicing.
+        null;
+  }
+
+  // Walk up from a node to the nearest named ancestor that satisfies
+  // the predicate, inclusive.
+  function enclosingNode(node, predicate) {
+    let n = node;
+    while (n) {
+      if (predicate(n)) return n;
+      n = n.parent;
+    }
+    return null;
+  }
+
+  // Smallest named node spanning [start, end).
+  function namedNodeSpanning(root, start, end) {
+    const n = root.namedDescendantForIndex
+      ? root.namedDescendantForIndex(start, end)
+      : null;
+    return n || null;
+  }
+
+  // ---- Caret → pixel coordinate mapping ----------------------------
+  //
+  // A hidden <div> is positioned exactly over the textarea and
+  // configured with identical font metrics, padding, wrap, and tab
+  // size. We copy the textarea's value up to the caret position,
+  // append a zero-width marker span, and read the marker's
+  // getBoundingClientRect() — that's where the caret sits in screen
+  // space. Standard mirror-div technique.
+
+  let mirrorDiv = null;
+  function caretCoords(textarea, offset) {
+    if (!mirrorDiv) {
+      mirrorDiv = document.createElement("div");
+      mirrorDiv.className = "mf2-caret-mirror";
+      mirrorDiv.setAttribute("aria-hidden", "true");
+      // Off-screen but laid out.
+      mirrorDiv.style.cssText =
+        "position:absolute;visibility:hidden;top:0;left:0;" +
+        "white-space:pre-wrap;word-wrap:break-word;overflow:hidden;";
+      document.body.appendChild(mirrorDiv);
+    }
+
+    const cs = window.getComputedStyle(textarea);
+    // Copy every metric that affects wrap and glyph positioning.
+    const propsToCopy = [
+      "boxSizing",
+      "borderTopWidth",
+      "borderRightWidth",
+      "borderBottomWidth",
+      "borderLeftWidth",
+      "paddingTop",
+      "paddingRight",
+      "paddingBottom",
+      "paddingLeft",
+      "fontStyle",
+      "fontVariant",
+      "fontWeight",
+      "fontSize",
+      "fontFamily",
+      "fontKerning",
+      "fontFeatureSettings",
+      "fontVariantLigatures",
+      "fontOpticalSizing",
+      "letterSpacing",
+      "lineHeight",
+      "textTransform",
+      "wordSpacing",
+      "tabSize",
+      "MozTabSize",
+    ];
+    for (const p of propsToCopy) mirrorDiv.style[p] = cs[p];
+
+    // Size the mirror to the textarea's content-box width.
+    const rect = textarea.getBoundingClientRect();
+    mirrorDiv.style.width = rect.width + "px";
+
+    const value = textarea.value.substring(0, offset);
+    mirrorDiv.textContent = value;
+
+    // A zero-width marker at the exact caret offset.
+    const marker = document.createElement("span");
+    marker.textContent = "\u200b";
+    mirrorDiv.appendChild(marker);
+
+    const markerRect = marker.getBoundingClientRect();
+    const mirrorRect = mirrorDiv.getBoundingClientRect();
+
+    // Translate from mirror-space to textarea-space.
+    const x =
+      rect.left +
+      (markerRect.left - mirrorRect.left) -
+      textarea.scrollLeft;
+    const y =
+      rect.top +
+      (markerRect.top - mirrorRect.top) -
+      textarea.scrollTop;
+
+    return { x, y, lineHeight: parseFloat(cs.lineHeight) || 20 };
+  }
+
+  // ---- Floating popup / dropdown framework -------------------------
+  //
+  // A minimal vanilla-JS floating-menu primitive. Builder returns
+  // a controller with `update(items)`, `moveTo(x, y)`, `close()`,
+  // and arrow-key handlers. The caller supplies `onSelect(item)`.
+  // Used by completion menu and outline picker; hover info / signature
+  // help use a simpler variant that just shows HTML.
+
+  function createFloatingMenu({ onSelect, onDismiss, renderItem }) {
+    const el = document.createElement("div");
+    el.className = "mf2-floating-menu";
+    el.setAttribute("role", "listbox");
+    document.body.appendChild(el);
+
+    let items = [];
+    let selectedIndex = 0;
+
+    function render() {
+      el.innerHTML = "";
+      items.forEach((item, i) => {
+        const row = document.createElement("div");
+        row.className = "mf2-floating-menu-item";
+        if (i === selectedIndex) row.classList.add("selected");
+        row.setAttribute("role", "option");
+        row.appendChild(renderItem(item));
+        row.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          onSelect(item);
+        });
+        el.appendChild(row);
+      });
+    }
+
+    function update(newItems) {
+      items = newItems;
+      if (selectedIndex >= items.length) selectedIndex = items.length - 1;
+      if (selectedIndex < 0) selectedIndex = 0;
+      render();
+    }
+
+    function moveTo(x, y) {
+      el.style.left = x + "px";
+      el.style.top = y + "px";
+      el.style.display = items.length > 0 ? "block" : "none";
+    }
+
+    function close() {
+      if (el.parentNode) el.parentNode.removeChild(el);
+      if (onDismiss) onDismiss();
+    }
+
+    function moveSelection(delta) {
+      if (items.length === 0) return;
+      selectedIndex = (selectedIndex + delta + items.length) % items.length;
+      render();
+    }
+
+    function commitSelection() {
+      if (items.length > 0) onSelect(items[selectedIndex]);
+    }
+
+    return { el, update, moveTo, close, moveSelection, commitSelection };
+  }
+
+  function createFloatingPanel(className) {
+    const el = document.createElement("div");
+    el.className = "mf2-floating-panel " + (className || "");
+    el.setAttribute("role", "tooltip");
+    el.style.display = "none";
+    document.body.appendChild(el);
+
+    function show(html, x, y) {
+      el.innerHTML = html;
+      el.style.left = x + "px";
+      el.style.top = y + "px";
+      el.style.display = "block";
+    }
+
+    function hide() {
+      el.style.display = "none";
+    }
+
+    function destroy() {
+      if (el.parentNode) el.parentNode.removeChild(el);
+    }
+
+    return { el, show, hide, destroy };
+  }
+
+  // ---- Function registry (client-side, static for now) -------------
+  //
+  // Minimum viable set to drive completion + hover + signature help
+  // without needing a server round trip. Covers the default-registry
+  // functions from the MF2 spec plus Localize's common additions.
+  //
+  // Each entry: { doc, options: [{name, doc, values?}] }.
+  // A later pass can replace this with a `push_event("mf2:registry", …)`
+  // from the server, carrying the host app's actual registered
+  // functions and docs.
+
+  const FUNCTION_REGISTRY = {
+    number: {
+      doc: "Format a number according to the locale's conventions.",
+      options: [
+        { name: "style", doc: "decimal | percent | currency", values: ["decimal", "percent", "currency"] },
+        { name: "minimumFractionDigits", doc: "Min digits after the decimal point" },
+        { name: "maximumFractionDigits", doc: "Max digits after the decimal point" },
+        { name: "minimumIntegerDigits", doc: "Min digits before the decimal point" },
+        { name: "useGrouping", doc: "always | auto | never", values: ["always", "auto", "never"] },
+        { name: "notation", doc: "standard | scientific | engineering | compact", values: ["standard", "scientific", "engineering", "compact"] },
+        { name: "select", doc: "plural | ordinal | exact", values: ["plural", "ordinal", "exact"] },
+      ],
+    },
+    integer: {
+      doc: "Format an integer (equivalent to :number maximumFractionDigits=0).",
+      options: [
+        { name: "useGrouping", doc: "always | auto | never", values: ["always", "auto", "never"] },
+      ],
+    },
+    currency: {
+      doc: "Format a monetary amount.",
+      options: [
+        { name: "currency", doc: "ISO 4217 currency code (e.g. USD, EUR, JPY)" },
+        { name: "currencyDisplay", doc: "symbol | narrowSymbol | code | name", values: ["symbol", "narrowSymbol", "code", "name"] },
+        { name: "currencySign", doc: "standard | accounting", values: ["standard", "accounting"] },
+      ],
+    },
+    percent: {
+      doc: "Format a number as a percentage (equivalent to :number style=percent).",
+      options: [
+        { name: "minimumFractionDigits", doc: "Min digits after the decimal point" },
+        { name: "maximumFractionDigits", doc: "Max digits after the decimal point" },
+      ],
+    },
+    date: {
+      doc: "Format a date (calendar portion only).",
+      options: [
+        { name: "dateStyle", doc: "full | long | medium | short", values: ["full", "long", "medium", "short"] },
+        { name: "calendar", doc: "Calendar system (gregorian, islamic, …)" },
+      ],
+    },
+    time: {
+      doc: "Format a time (clock portion only).",
+      options: [
+        { name: "timeStyle", doc: "full | long | medium | short", values: ["full", "long", "medium", "short"] },
+        { name: "hourCycle", doc: "h11 | h12 | h23 | h24", values: ["h11", "h12", "h23", "h24"] },
+      ],
+    },
+    datetime: {
+      doc: "Format a date and time together.",
+      options: [
+        { name: "dateStyle", doc: "full | long | medium | short", values: ["full", "long", "medium", "short"] },
+        { name: "timeStyle", doc: "full | long | medium | short", values: ["full", "long", "medium", "short"] },
+      ],
+    },
+    string: {
+      doc: "Format as a string and apply selection rules.",
+      options: [
+        { name: "select", doc: "exact (default)", values: ["exact"] },
+      ],
+    },
+    list: {
+      doc: "Format an array / list as a localised comma-separated phrase.",
+      options: [
+        { name: "type", doc: "conjunction | disjunction | unit", values: ["conjunction", "disjunction", "unit"] },
+        { name: "style", doc: "long | short | narrow", values: ["long", "short", "narrow"] },
+      ],
+    },
+    unit: {
+      doc: "Format a measurement (e.g. 3.2 km, 5 °C).",
+      options: [
+        { name: "unit", doc: "ISO unit code (e.g. meter, kilometer, celsius)" },
+        { name: "unitDisplay", doc: "long | short | narrow", values: ["long", "short", "narrow"] },
+      ],
+    },
+  };
+
+  // ---- CLDR plural categories (simplified) -------------------------
+  //
+  // For the `.match`-skeleton feature. Full CLDR has per-locale
+  // plural rules; for skeleton generation we just need the *set of
+  // categories that could apply* to a locale. This is a hand-picked
+  // subset based on the CLDR Plural Rules spec. Sufficient for the
+  // "insert skeleton" UX.
+
+  function pluralCategoriesFor(locale) {
+    const base = (locale || "en").split(/[-_]/)[0].toLowerCase();
+    const byBase = {
+      en: ["one", "other"],
+      de: ["one", "other"],
+      es: ["one", "other"],
+      fr: ["one", "many", "other"],
+      it: ["one", "many", "other"],
+      pt: ["one", "many", "other"],
+      nl: ["one", "other"],
+      sv: ["one", "other"],
+      da: ["one", "other"],
+      no: ["one", "other"],
+      fi: ["one", "other"],
+      ja: ["other"],
+      zh: ["other"],
+      ko: ["other"],
+      ar: ["zero", "one", "two", "few", "many", "other"],
+      he: ["one", "two", "many", "other"],
+      ru: ["one", "few", "many", "other"],
+      pl: ["one", "few", "many", "other"],
+      cs: ["one", "few", "many", "other"],
+      sk: ["one", "few", "many", "other"],
+      uk: ["one", "few", "many", "other"],
+      hr: ["one", "few", "other"],
+      sr: ["one", "few", "other"],
+      ga: ["one", "two", "few", "many", "other"],
+      cy: ["zero", "one", "two", "few", "many", "other"],
+      lt: ["one", "few", "other"],
+      lv: ["zero", "one", "other"],
+    };
+    return byBase[base] || ["one", "other"];
+  }
+
   // ------------------------------------------------------------------
   // Phoenix LiveView hook. One instance per editor element.
   // ------------------------------------------------------------------
@@ -752,6 +1229,31 @@
       this.onInput = () => this.update();
       this.textarea.addEventListener("input", this.onInput);
 
+      // ========================================================
+      // IDE-style feature wiring (items 1-11 in TODO.md).
+      // ========================================================
+
+      // Keybindings: F2 rename, F12 goto-def, Cmd+Shift+O outline,
+      // Cmd+Shift+→/← structural selection, Enter smart-indent.
+      this.onKeydown = (e) => this._handleKeydown(e);
+      this.textarea.addEventListener("keydown", this.onKeydown);
+
+      // Cmd/Ctrl-click on a `$variable` → goto its declaration.
+      this.onMousedown = (e) => this._handleMousedown(e);
+      this.textarea.addEventListener("mousedown", this.onMousedown);
+
+      // Completion trigger on `$` / `:` / `@`. Also intercepts
+      // `.match` + Tab for the pluralisation-skeleton expansion.
+      this.onCompletionInput = (e) => this._handleCompletionInput(e);
+      this.textarea.addEventListener("input", this.onCompletionInput);
+
+      // Dismiss floating UIs on blur unless focus went into the
+      // completion menu itself (handled by menu's own mousedown).
+      this.onFeatureBlur = () => this._closeCompletion();
+      this.textarea.addEventListener("blur", this.onFeatureBlur);
+
+      // ========================================================
+
       this.update();
     },
 
@@ -765,6 +1267,14 @@
           this.textarea.removeEventListener("blur", this.onBlur);
         if (this.onBeforeInput)
           this.textarea.removeEventListener("beforeinput", this.onBeforeInput);
+        if (this.onKeydown)
+          this.textarea.removeEventListener("keydown", this.onKeydown);
+        if (this.onMousedown)
+          this.textarea.removeEventListener("mousedown", this.onMousedown);
+        if (this.onCompletionInput)
+          this.textarea.removeEventListener("input", this.onCompletionInput);
+        if (this.onFeatureBlur)
+          this.textarea.removeEventListener("blur", this.onFeatureBlur);
       }
       if (this.el) {
         if (this.onMouseMove)
@@ -778,6 +1288,22 @@
       if (this.tooltipEl && this.tooltipEl.parentNode) {
         this.tooltipEl.parentNode.removeChild(this.tooltipEl);
         this.tooltipEl = null;
+      }
+      if (this._completionMenu) {
+        this._completionMenu.close();
+        this._completionMenu = null;
+      }
+      if (this._outlineMenu) {
+        this._outlineMenu.close();
+        this._outlineMenu = null;
+      }
+      if (this._hoverPanel) {
+        this._hoverPanel.destroy();
+        this._hoverPanel = null;
+      }
+      if (this._signaturePanel) {
+        this._signaturePanel.destroy();
+        this._signaturePanel = null;
       }
       if (this.tree) {
         this.tree.delete();
@@ -819,6 +1345,523 @@
       if (this.tooltipEl) this.tooltipEl.style.display = "none";
     },
 
+    // ==================================================================
+    //                   IDE-STYLE FEATURE METHODS
+    //
+    // One method per feature, plus three dispatchers for the three
+    // event listeners wired in mounted(). Each feature is pretty small
+    // on its own — the shared heavy lifting is in the top-of-file
+    // infrastructure block (locals graph, tree helpers, caret coords,
+    // popup framework).
+    //
+    // All feature methods no-op gracefully if `this.tree` is null
+    // (not yet parsed or parse failed), so wiring order in mounted()
+    // doesn't matter.
+    // ==================================================================
+
+    _handleKeydown(e) {
+      // If either floating menu is open, it consumes arrow/enter/esc.
+      const activeMenu =
+        (this._completionMenu && this._completionMenu.isOpen && this._completionMenu) ||
+        (this._outlineMenu && this._outlineMenu.isOpen && this._outlineMenu) ||
+        null;
+
+      if (activeMenu) {
+        if (e.key === "Escape") {
+          activeMenu.close();
+          e.preventDefault();
+          return;
+        }
+        if (e.key === "ArrowDown") {
+          activeMenu.moveSelection(1);
+          e.preventDefault();
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          activeMenu.moveSelection(-1);
+          e.preventDefault();
+          return;
+        }
+        if (e.key === "Enter" || e.key === "Tab") {
+          activeMenu.commitSelection();
+          e.preventDefault();
+          return;
+        }
+      }
+
+      // F12 → goto definition.
+      if (e.key === "F12") {
+        e.preventDefault();
+        this.gotoDefinition();
+        return;
+      }
+
+      // F2 → rename.
+      if (e.key === "F2") {
+        e.preventDefault();
+        this.renameInScope();
+        return;
+      }
+
+      // Cmd/Ctrl+Shift+O → outline.
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "o" || e.key === "O")) {
+        e.preventDefault();
+        this.showOutline();
+        return;
+      }
+
+      // Cmd/Ctrl+Shift+ArrowRight / ArrowLeft → structural selection.
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey) {
+        if (e.key === "ArrowRight") {
+          if (this.expandSelection()) e.preventDefault();
+          return;
+        }
+        if (e.key === "ArrowLeft") {
+          if (this.shrinkSelection()) e.preventDefault();
+          return;
+        }
+      }
+
+      // Enter → smart indent.
+      if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (this._handleSmartIndent(e)) e.preventDefault();
+        return;
+      }
+
+      // Tab after `.match` on a blank line → pluralisation skeleton.
+      if (e.key === "Tab" && !e.shiftKey) {
+        if (this._handlePluralSkeleton(e)) e.preventDefault();
+        return;
+      }
+    },
+
+    _handleMousedown(e) {
+      // Cmd/Ctrl + click on a variable reference → goto definition.
+      if (!(e.metaKey || e.ctrlKey)) return;
+      if (e.button !== 0) return;
+
+      // We need the caret offset at the click point. Let the browser
+      // apply its default caret placement first, then run our logic
+      // on the next tick when textarea.selectionStart is updated.
+      setTimeout(() => {
+        const offset = this.textarea.selectionStart;
+        if (this._isOverVariable(offset)) {
+          this.gotoDefinition();
+        }
+      }, 0);
+    },
+
+    _handleCompletionInput(e) {
+      // Only plain typed characters trigger completion.
+      if (!e || e.inputType !== "insertText" || typeof e.data !== "string") {
+        return;
+      }
+      const ch = e.data;
+      const caret = this.textarea.selectionStart;
+
+      if (ch === "$") {
+        this._openCompletion("variable", caret);
+        return;
+      }
+      if (ch === ":") {
+        this._openCompletion("function", caret);
+        return;
+      }
+      if (ch === "@") {
+        this._openCompletion("attribute", caret);
+        return;
+      }
+
+      // If the menu is open and the user types a name character, let
+      // the character filter through and update the menu's items.
+      if (this._completionMenu && this._completionMenu.isOpen) {
+        if (/[A-Za-z0-9_\-.]/.test(ch)) {
+          this._refreshCompletion(caret);
+        } else {
+          this._closeCompletion();
+        }
+      }
+    },
+
+    // ---- Tree-walking helpers ---------------------------------------
+
+    _nodeAtCaret() {
+      if (!this.tree) return null;
+      const caret = this.textarea.selectionStart;
+      return this.tree.rootNode.namedDescendantForIndex(caret, caret);
+    },
+
+    _isOverVariable(offset) {
+      if (!this.tree) return false;
+      const node = this.tree.rootNode.namedDescendantForIndex(offset, offset);
+      return enclosingNode(node, (n) => n.type === "variable") !== null;
+    },
+
+    // ---- Item 1: Goto-definition -----------------------------------
+
+    gotoDefinition() {
+      if (!this._locals || !this.tree) return;
+      const node = this._nodeAtCaret();
+      if (!node) return;
+      const varNode = enclosingNode(node, (n) => n.type === "variable");
+      if (!varNode) return;
+      const nameNode = firstNamedChildOfType(varNode, "name");
+      if (!nameNode) return;
+      const name = nameNode.text;
+      const def = this._locals.definitions.get(name);
+      if (!def) return;
+
+      // Move caret to the definition's name start.
+      const target = def.nameNode.startIndex;
+      this.textarea.focus();
+      this.textarea.setSelectionRange(target, target + name.length);
+      this._scrollCaretIntoView();
+    },
+
+    _scrollCaretIntoView() {
+      // Rough approximation: use the mirror-textarea caret coords and
+      // nudge textarea.scrollTop so the caret sits in the middle third.
+      const coords = caretCoords(this.textarea, this.textarea.selectionStart);
+      const rect = this.textarea.getBoundingClientRect();
+      if (coords.y < rect.top || coords.y > rect.bottom - coords.lineHeight) {
+        this.textarea.scrollTop = Math.max(
+          0,
+          this.textarea.scrollTop + (coords.y - rect.top) - rect.height / 3
+        );
+      }
+    },
+
+    // ---- Item 2: Rename-in-scope -----------------------------------
+
+    renameInScope() {
+      if (!this._locals) return;
+      const node = this._nodeAtCaret();
+      if (!node) return;
+      const varNode = enclosingNode(node, (n) => n.type === "variable");
+      if (!varNode) return;
+      const oldName = firstNamedChildOfType(varNode, "name").text;
+
+      const newName = window.prompt(
+        `Rename $${oldName} to:`,
+        oldName
+      );
+      if (!newName || newName === oldName) return;
+      if (!/^[A-Za-z_][A-Za-z0-9_\-.]*$/.test(newName)) {
+        window.alert(
+          "Rename aborted: names must start with a letter or underscore."
+        );
+        return;
+      }
+
+      // Collect every occurrence (definitions + references) in
+      // descending byte order so splice indices remain valid.
+      const occurrences = [];
+      const def = this._locals.definitions.get(oldName);
+      if (def) occurrences.push({ node: def.nameNode });
+      const refs = this._locals.referencesByName.get(oldName) || [];
+      for (const r of refs) occurrences.push({ node: r.nameNode });
+
+      occurrences.sort((a, b) => b.node.startIndex - a.node.startIndex);
+
+      let value = this.textarea.value;
+      for (const occ of occurrences) {
+        const s = occ.node.startIndex;
+        const e = occ.node.endIndex;
+        value = value.slice(0, s) + newName + value.slice(e);
+      }
+
+      // Apply, move caret to the first occurrence of the new name.
+      this.textarea.value = value;
+      const caret =
+        occurrences.length > 0
+          ? occurrences[occurrences.length - 1].node.startIndex
+          : this.textarea.selectionStart;
+      this.textarea.setSelectionRange(caret, caret + newName.length);
+      this.textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    },
+
+    // ---- Item 5: Outline picker -----------------------------------
+
+    showOutline() {
+      if (!this._locals) return;
+      const items = [];
+      for (const [name, def] of this._locals.definitions) {
+        items.push({
+          label: `$${name}`,
+          hint: def.kind === "input" ? ".input" : ".local",
+          offset: def.varNode.startIndex,
+        });
+      }
+      if (items.length === 0) {
+        window.alert("No declarations in this message.");
+        return;
+      }
+      items.sort((a, b) => a.offset - b.offset);
+
+      if (this._outlineMenu) this._outlineMenu.close();
+
+      this._outlineMenu = createFloatingMenu({
+        onSelect: (item) => {
+          this.textarea.focus();
+          this.textarea.setSelectionRange(item.offset, item.offset);
+          this._scrollCaretIntoView();
+          this._outlineMenu.close();
+          this._outlineMenu = null;
+        },
+        onDismiss: () => {
+          this._outlineMenu = null;
+        },
+        renderItem: (item) => {
+          const el = document.createElement("div");
+          const label = document.createElement("span");
+          label.className = "mf2-outline-label";
+          label.textContent = item.label;
+          const hint = document.createElement("span");
+          hint.className = "mf2-outline-hint";
+          hint.textContent = item.hint;
+          el.appendChild(label);
+          el.appendChild(hint);
+          return el;
+        },
+      });
+      this._outlineMenu.isOpen = true;
+      this._outlineMenu.update(items);
+
+      const rect = this.textarea.getBoundingClientRect();
+      this._outlineMenu.moveTo(rect.left + 12, rect.top + 12);
+    },
+
+    // ---- Item 7: Structural selection --------------------------------
+
+    expandSelection() {
+      if (!this.tree) return false;
+      const start = this.textarea.selectionStart;
+      const end = this.textarea.selectionEnd;
+
+      const current =
+        this.tree.rootNode.namedDescendantForIndex(start, end) ||
+        this.tree.rootNode;
+
+      // If the current selection exactly matches the current node's
+      // span, step up to the parent. Otherwise, expand to the span of
+      // the current node.
+      let target = current;
+      if (
+        current.startIndex === start &&
+        current.endIndex === end &&
+        current.parent
+      ) {
+        target = current.parent;
+      }
+      if (!target) return false;
+
+      this._selectionStack = this._selectionStack || [];
+      this._selectionStack.push({ start, end });
+      this.textarea.setSelectionRange(target.startIndex, target.endIndex);
+      return true;
+    },
+
+    shrinkSelection() {
+      if (!this._selectionStack || this._selectionStack.length === 0) {
+        return false;
+      }
+      const prev = this._selectionStack.pop();
+      this.textarea.setSelectionRange(prev.start, prev.end);
+      return true;
+    },
+
+    // ---- Item 6: Smart newline indent --------------------------------
+
+    _handleSmartIndent(_e) {
+      const caret = this.textarea.selectionStart;
+      if (caret !== this.textarea.selectionEnd) return false; // has selection
+
+      // Current line's leading whitespace.
+      const value = this.textarea.value;
+      const lineStart = value.lastIndexOf("\n", caret - 1) + 1;
+      const line = value.slice(lineStart, caret);
+      const leadingWs = line.match(/^[ \t]*/)[0];
+
+      // If caret is immediately inside `{{` or `.match` context, add
+      // an extra indent step. We use the node at caret to decide.
+      let extraIndent = "";
+      if (this.tree) {
+        const node = this.tree.rootNode.namedDescendantForIndex(caret, caret);
+        const within = enclosingNode(node, (n) =>
+          ["quoted_pattern", "matcher", "variant"].includes(n.type)
+        );
+        if (within) extraIndent = "  ";
+      }
+
+      const insertion = "\n" + leadingWs + extraIndent;
+      document.execCommand
+        ? document.execCommand("insertText", false, insertion)
+        : this._splice(caret, caret, insertion);
+      return true;
+    },
+
+    _splice(start, end, replacement) {
+      const v = this.textarea.value;
+      this.textarea.value = v.slice(0, start) + replacement + v.slice(end);
+      const newPos = start + replacement.length;
+      this.textarea.setSelectionRange(newPos, newPos);
+      this.textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    },
+
+    // ---- Item 11: .match pluralisation skeleton ----------------------
+
+    _handlePluralSkeleton(_e) {
+      const caret = this.textarea.selectionStart;
+      if (caret !== this.textarea.selectionEnd) return false;
+
+      const value = this.textarea.value;
+      const lineStart = value.lastIndexOf("\n", caret - 1) + 1;
+      const lineSoFar = value.slice(lineStart, caret);
+
+      // Match `.match $var` at end of line (optionally followed by
+      // `:number` annotation).
+      const m = lineSoFar.match(/^\s*\.match\s+\$(\S+)(?:\s+:number)?\s*$/);
+      if (!m) return false;
+
+      const locale = this.el.dataset.mf2Locale || "en";
+      const categories = pluralCategoriesFor(locale);
+
+      // One key per category, each with a `{{…}}` placeholder, plus a
+      // catchall `*`. Each variant on its own line.
+      const lines = categories.map((cat) => {
+        if (cat === "other") return `* {{}}`;
+        return `${cat} {{}}`;
+      });
+      // Make sure there's a catchall `*` even if `other` wasn't in
+      // categories (shouldn't happen, but safe).
+      if (!lines.some((l) => l.startsWith("*"))) lines.push("* {{}}");
+
+      const insertion = "\n" + lines.join("\n");
+      this._splice(caret, caret, insertion);
+
+      // Put caret inside the first variant's pattern.
+      const firstPatternOffset =
+        caret + "\n".length + lines[0].indexOf("{{") + 2;
+      this.textarea.setSelectionRange(firstPatternOffset, firstPatternOffset);
+      return true;
+    },
+
+    // ---- Item 8: Completion menu -----------------------------------
+
+    _openCompletion(kind, caret) {
+      this._closeCompletion();
+      const items = this._completionItems(kind, "");
+      if (items.length === 0) return;
+
+      const self = this;
+      this._completionMenu = createFloatingMenu({
+        onSelect: (item) => self._commitCompletion(item),
+        onDismiss: () => {
+          self._completionMenu = null;
+        },
+        renderItem: (item) => {
+          const el = document.createElement("div");
+          const label = document.createElement("span");
+          label.className = "mf2-completion-label";
+          label.textContent = item.label;
+          const hint = document.createElement("span");
+          hint.className = "mf2-completion-hint";
+          hint.textContent = item.hint || "";
+          el.appendChild(label);
+          el.appendChild(hint);
+          return el;
+        },
+      });
+      this._completionMenu.isOpen = true;
+      this._completionMenu.kind = kind;
+      this._completionMenu.triggerOffset = caret; // position of the trigger char
+      this._completionMenu.update(items);
+
+      const coords = caretCoords(this.textarea, caret);
+      this._completionMenu.moveTo(coords.x, coords.y + coords.lineHeight + 4);
+    },
+
+    _refreshCompletion(caret) {
+      if (!this._completionMenu) return;
+      const trigger = this._completionMenu.triggerOffset;
+      const prefix = this.textarea.value.slice(trigger, caret);
+      const items = this._completionItems(this._completionMenu.kind, prefix);
+      this._completionMenu.update(items);
+
+      const coords = caretCoords(this.textarea, trigger);
+      this._completionMenu.moveTo(coords.x, coords.y + coords.lineHeight + 4);
+    },
+
+    _completionItems(kind, prefix) {
+      const pfx = prefix.toLowerCase();
+      if (kind === "variable") {
+        if (!this._locals) return [];
+        const items = [];
+        for (const [name, def] of this._locals.definitions) {
+          if (name.toLowerCase().startsWith(pfx)) {
+            items.push({
+              label: name,
+              hint: def.kind === "input" ? ".input" : ".local",
+              insertText: name,
+            });
+          }
+        }
+        return items.sort((a, b) => a.label.localeCompare(b.label));
+      }
+      if (kind === "function") {
+        return Object.entries(FUNCTION_REGISTRY)
+          .filter(([name]) => name.toLowerCase().startsWith(pfx))
+          .map(([name, spec]) => ({
+            label: name,
+            hint: spec.doc,
+            insertText: name,
+          }));
+      }
+      if (kind === "attribute") {
+        // MF2 attributes aren't a registry; offer common ones.
+        const commonAttrs = [
+          { label: "translate", hint: "translation intent" },
+          { label: "locale", hint: "locale override" },
+          { label: "dir", hint: "directionality" },
+        ];
+        return commonAttrs
+          .filter((a) => a.label.toLowerCase().startsWith(pfx))
+          .map((a) => ({ ...a, insertText: a.label }));
+      }
+      return [];
+    },
+
+    _commitCompletion(item) {
+      if (!this._completionMenu) return;
+      const trigger = this._completionMenu.triggerOffset;
+      const caret = this.textarea.selectionStart;
+      // Replace from trigger to caret with (trigger-char stays) + insertText.
+      // Trigger char itself is already in the text — we only replace what
+      // the user has typed AFTER it.
+      this._splice(trigger, caret, item.insertText);
+      this._closeCompletion();
+    },
+
+    _closeCompletion() {
+      if (this._completionMenu) {
+        this._completionMenu.close();
+        this._completionMenu = null;
+      }
+    },
+
+    // ---- Item 9: Hover info (variables only; functions need registry) ----
+
+    // Extends the existing onMouseMove behaviour. The existing handler
+    // (in mounted()) already does diagnostic tooltips via elementsFromPoint.
+    // For variable hover we augment that: if the mouse is over a span
+    // whose content is a `(name)` inside a `variable`, show an info
+    // tooltip with the declaration source.
+
+    // Instead of hooking mouseMove again (there's already one), we
+    // intercept in a lightweight way: rely on the existing findDiagnosticSpanAt
+    // to skip non-diagnostic spans, and add a separate hover handler.
+    // See _installVariableHover() called at mount.
+
     applyCanonical(value) {
       const prevStart = this.textarea.selectionStart;
       this.textarea.value = value;
@@ -850,6 +1893,10 @@
 
       if (this.tree) this.tree.delete();
       this.tree = tree;
+
+      // Rebuild the locals graph. Used by rename, goto-def, outline,
+      // completion, and the unknown-variable paint pass below.
+      this._locals = buildLocalsGraph(tree.rootNode);
 
       // Re-check bracket matching against the new tree; caret may
       // not have moved but the tree has been replaced.

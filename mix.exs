@@ -45,6 +45,7 @@ defmodule Mf2WasmEditor.MixProject do
         "lib",
         "priv/static",
         "priv/grammar",
+        "priv/themes",
         "mix.exs",
         "README.md",
         "CHANGELOG.md",

@@ -61,6 +61,8 @@ These were in the original scope of this pass but are only partially shipped; no
 
 * [ ] **Real CLDR plural rules** — replace the hand-selected per-locale categories with a full `Localize.Number.Plural`-backed push from the server. The current fallback is good enough for common languages; a server push covers all of CLDR.
 
+* [ ] **Inline-style theming API for `Localize.Message.to_html/2`** — cross-package feature: ship a new `Mf2WasmEditor.Themes` Elixir module that exposes the 30 themes as Elixir palette maps (`%{variable: "color: #fd971f; font-weight: bold", …}`). Then `localize` picks up `mf2_wasm_editor` as an **optional** dep and adds `:inline_styles` + `:theme` options to `to_html/2`: when both are set, emit `<span style="…">` instead of `<span class="…">` so rendered output pastes into Keynote / PowerPoint / rich-text email / Word. The CSS-class workflow already covers GitHub / blogs / Notion, so this is a niche-but-nice polish. Plan: (1) extend `scripts/generate_themes.exs` to emit `lib/mf2_wasm_editor/themes.ex` alongside the CSS, exposing `palette(:monokai)` → `{:ok, map}` and `list_themes/0`; (2) in `localize`, add `{:mf2_wasm_editor, "~> 0.1", optional: true}`, extend `Formatter.HTML.render/2`, guard with `Code.ensure_loaded?/1`, and raise a clear error if the optional dep is missing. ~½ day. See conversation on 2026-04-18 for full design.
+
 ## Big
 
 * [ ] **Fold long `.match` variants** — show the header, collapse the rest behind a disclosure. Requires a gutter overlay (currently none) and some model of "logical lines" that accounts for wrapping. This is where the textarea-over-pre approach really starts to strain; budget it with a view to migrating to CodeMirror if it becomes painful.

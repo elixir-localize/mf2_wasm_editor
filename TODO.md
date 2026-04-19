@@ -85,6 +85,24 @@ These were in the original scope of this pass but are only partially shipped; no
 
 * [ ] (Nice-to-have) An LSP server — `localize_mf2_lsp`, new package. Would subsume most of the above in a way that works for CLI users (VS Code, Helix, Neovim, Zed) without shipping a WASM bundle.
 
+## Post-npm-publication ecosystem follow-ups
+
+These are cross-cutting items that unblock once `tree-sitter-mf2` is published on npm. They span multiple packages; tracked here as the most active planning doc but touch `localize_mf2_treesitter`, `mf2_editor_extensions`, and (indirectly) `localize_playground` too.
+
+* [x] **Switch `mix mf2_wasm_editor.sync` to fetch from a CDN.** Done — pinned `@tree_sitter_mf2_version` at module top, fetches from `https://unpkg.com/tree-sitter-mf2@<version>/…` over verified HTTPS. `MF2_TREESITTER_DIR` is the offline override. `--build-wasm` now explicitly requires the env var.
+
+* [x] **Do the same for `localize_mf2_treesitter`.** Done — same pattern, same pin variable name, same override env var. Both sync tasks document the "keep pins in lockstep" convention in their READMEs. Ecosystem invariant: bump both pin strings together, commit the refreshed vendored files in each package, release together.
+
+* [ ] **Update `mf2_editor_extensions` to depend on the published npm package.** The VS Code extension especially should have `"dependencies": { "tree-sitter-mf2": "^0.1.0" }` in its package.json rather than vendoring. Zed / Helix / Neovim integrations usually reference the grammar via git URL — update those to npm-via-tag once available.
+
+* [ ] **Thin JS test coverage for `mf2_editor.js`.** Currently only 3 Elixir doctests + 4 module tests cover the package; the ~85 KB `priv/static/mf2_editor.js` hook is exercised only through the playground. Add a Node-based smoke test (~30 lines) that loads the WASM, parses a handful of canonical messages, and asserts expected tree shape and diagnostic output. Put it under `test/js/` and wire into `mix test` via a small shell-out or a `test/js/package.json` with its own `npm test` the Elixir suite calls.
+
+* [ ] **Ecosystem version-alignment doc.** Add a small compatibility table to each of `mf2_wasm_editor`, `localize_mf2_treesitter`, and `mf2_treesitter` READMEs showing "this version of X is built against Y of tree-sitter-mf2 and Z of web-tree-sitter". Saves future-self archaeology when bumping any one of them.
+
+* [ ] **Post-publication release sequence** (order matters): (1) publish `tree-sitter-mf2@0.1.0` on npm; (2) update both `mf2_wasm_editor` and `localize_mf2_treesitter` sync tasks to fetch from unpkg at `0.1.0`; (3) publish `mf2_wasm_editor@0.1.0` on hex; (4) publish `localize_mf2_treesitter@0.1.0` on hex; (5) deploy `localize_playground` with the new hex deps and verify the Message tab end-to-end.
+
+* [ ] **Verify `localize_playground` still deploys** after the ecosystem refactor. Deployment target is fly.io (per earlier work, which constrained us to Elixir 1.19-compatible images). Do a pre-production smoke test before cutting the playground over.
+
 ## Non-features / explicit deferrals
 
 * **Incremental parse** (`parser.parse(source, oldTree)`) — requires a correct `oldTree.edit(descriptor)` call. Full-parse is already microseconds for kilobyte inputs; don't pay the complexity unless someone is editing a 100 KB string.

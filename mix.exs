@@ -22,7 +22,11 @@ defmodule Mf2WasmEditor.MixProject do
 
   def application do
     [
-      extra_applications: [:logger]
+      # `:ssl`, `:inets`, `:public_key` are used by the
+      # `mix mf2_wasm_editor.sync` task to fetch the grammar from
+      # the unpkg CDN. They're OTP-bundled so they add no third-party
+      # dependency surface.
+      extra_applications: [:logger, :ssl, :inets, :public_key]
     ]
   end
 
@@ -46,6 +50,7 @@ defmodule Mf2WasmEditor.MixProject do
         "priv/static",
         "priv/grammar",
         "priv/themes",
+        "guides",
         "mix.exs",
         "README.md",
         "CHANGELOG.md",
@@ -64,7 +69,17 @@ defmodule Mf2WasmEditor.MixProject do
     [
       source_ref: "v#{@version}",
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md", "LICENSE.md"]
+      formatters: ["html", "markdown"],
+      extras: [
+        "README.md",
+        "guides/wiring.md": [title: "Wiring"],
+        "guides/features.md": [title: "Features"],
+        "CHANGELOG.md": [title: "Changelog"],
+        "LICENSE.md": [title: "Licence"]
+      ],
+      groups_for_extras: [
+        Guides: ["guides/wiring.md", "guides/features.md"]
+      ]
     ]
   end
 

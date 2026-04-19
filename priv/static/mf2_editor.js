@@ -139,29 +139,395 @@
     return paint;
   }
 
-  function collectDiagnostics(rootNode) {
-    const out = [];
-    if (!rootNode.hasError) return out;
+  // Parent types that tree-sitter's GLR recovery hangs generic
+  // top-level ERROR nodes off when it can't localise a problem. The
+  // resulting diagnostic is the unhelpful "Unexpected input in
+  // message". When our own brace scan produces a more specific hit
+  // for the same edit, we suppress these.
+  const TOP_LEVEL_ERROR_PARENTS = new Set([
+    "source_file",
+    "message",
+    "simple_message",
+    "complex_message",
+  ]);
 
-    // Depth-first walk. Tree-sitter's GLR error recovery yields two
-    // flavours of broken-state node: `isMissing` for required tokens
-    // the grammar expected but didn't find, and `isError` for spans
-    // of input that couldn't be fitted to any production. Either
-    // produces a visible diagnostic; everything else is skipped. We
-    // only descend when the subtree contains an error anywhere.
+  // Line-scoped scan for an unmatched single `{`. Catches the
+  // single most common MF2 mistake — a forgotten closing `}` on a
+  // placeholder — with a diagnostic pointing directly at the
+  // offending `{`, rather than tree-sitter's generic "Unexpected
+  // input in message" fallback.
+  //
+  // Design: run per-line and only balance single braces. `{{` / `}}`
+  // are quoted-pattern delimiters that may legitimately span lines,
+  // so we skip them entirely rather than try to pair them up. What
+  // matters is: every single `{` must be closed by a single `}`
+  // before the line ends. Any `{` still open when the line ends is
+  // reported.
+  //
+  // Skip conditions inside a line:
+  //   - Backslash-escaped braces (`\\{`, `\\}`): text, not syntax.
+  //   - Braces inside a quoted literal (`|…|`): text, not syntax.
+  //   - `{{` and `}}` digraphs: skipped whole (not single braces).
+  //
+  // This only runs when tree-sitter has already reported errors —
+  // so a valid multi-line placeholder (grammar-legal but rare)
+  // parses cleanly and never reaches here, no false positive.
+  function scanUnmatchedBraces(source) {
+    const errors = [];
+    const lines = source.split("\n");
+    let lineStart = 0;
+
+    for (let row = 0; row < lines.length; row++) {
+      const line = lines[row];
+      const stack = []; // column indices of unmatched `{` on this line
+      let inLiteral = false;
+
+      for (let j = 0; j < line.length; j++) {
+        const c = line[j];
+
+        if (c === "\\" && j + 1 < line.length) {
+          j++;
+          continue;
+        }
+
+        if (c === "|") {
+          inLiteral = !inLiteral;
+          continue;
+        }
+
+        if (inLiteral) continue;
+
+        if (c === "{") {
+          if (line[j + 1] === "{") {
+            // `{{` — quoted-pattern opener, skip both chars.
+            j++;
+          } else {
+            stack.push(j);
+          }
+        } else if (c === "}") {
+          if (line[j + 1] === "}") {
+            // `}}` — quoted-pattern closer, skip both chars.
+            j++;
+          } else if (stack.length) {
+            stack.pop();
+          }
+          // A lone `}` with no matching `{` on the same line isn't
+          // flagged here: it may be the second half of a `{{…}}`
+          // closer split oddly across lines. Tree-sitter catches
+          // that case well enough on its own.
+        }
+      }
+
+      // Any `{` still on the stack at end of line is unclosed.
+      for (const col of stack) {
+        errors.push({
+          startIndex: lineStart + col,
+          endIndex: lineStart + col + 1,
+          startPosition: { row, column: col },
+          endPosition: { row, column: col + 1 },
+          message: "Missing closing `}` on this line",
+        });
+      }
+
+      lineStart += line.length + 1; // +1 for the `\n`
+    }
+
+    return errors;
+  }
+
+  // Scan for `.match` with no following selector. Tree-sitter's
+  // error recovery often can't localise this at the match_statement
+  // level — the ERROR bubbles up to a higher parent and surfaces as
+  // a generic "Unexpected input in message". Detecting the
+  // missing-selector case up front lets us point directly at the
+  // `.match` keyword with a specific, actionable message.
+  //
+  // Matches `.match` at the start of a line (possibly indented).
+  // A selector is present iff the next non-whitespace character is
+  // `$` (selectors are always variables in MF2).
+  function scanMissingMatchSelector(source) {
+    const errors = [];
+    const regex = /(^|\n)([^\S\n]*)\.match\b/g;
+    let m;
+    while ((m = regex.exec(source)) !== null) {
+      const matchStart = m.index + m[1].length + m[2].length;
+      const matchEnd = matchStart + ".match".length;
+
+      // Skip whitespace (including newlines) after `.match`.
+      let i = matchEnd;
+      while (i < source.length && /\s/.test(source[i])) i++;
+
+      // `$...` means a selector is there — nothing to report.
+      if (i < source.length && source[i] === "$") continue;
+
+      const startPos = positionForIndex(source, matchStart);
+      const endPos = positionForIndex(source, matchEnd);
+      errors.push({
+        startIndex: matchStart,
+        endIndex: matchEnd,
+        startPosition: startPos,
+        endPosition: endPos,
+        message:
+          "Expected at least one selector after `.match` — a variable like `$count` " +
+          "(e.g. `.match $count`)",
+      });
+    }
+    return errors;
+  }
+
+  // Convert a byte index into `{row, column}` for a synthetic
+  // diagnostic. Linear scan is fine: sources are small and this
+  // runs at most a handful of times per parse.
+  function positionForIndex(source, index) {
+    let row = 0;
+    let lastNewline = -1;
+    for (let i = 0; i < index; i++) {
+      if (source[i] === "\n") {
+        row++;
+        lastNewline = i;
+      }
+    }
+    return { row, column: index - lastNewline - 1 };
+  }
+
+  // Scan for a `{{…}}` quoted pattern appearing where a variant key
+  // should precede it. A common beginner mistake is writing
+  //
+  //     .match $count
+  //     {{You have no messages.}}
+  //
+  // and expecting that to be a matcher with one variant. MF2
+  // requires every variant to start with a key (`*` or a literal),
+  // so the pattern above is missing `*` before the `{{`. Tree-sitter
+  // recovery for this tends to yield a generic top-level ERROR
+  // ("Unexpected input in message") rather than pointing at the
+  // specific line, so we catch it here.
+  //
+  // Strategy: walk lines from each `.match $var` line forward. Any
+  // line whose first non-whitespace content is `{{` (and not `{{{`,
+  // which would be a literal `{` inside a pattern) is flagged. Stop
+  // on another top-level declaration keyword.
+  function scanMissingVariantKey(source) {
+    const errors = [];
+    const lines = source.split("\n");
+    let lineStart = 0;
+
+    let inMatcher = false;
+    for (let row = 0; row < lines.length; row++) {
+      const line = lines[row];
+      const trimStart = line.length - line.trimStart().length;
+      const trimmed = line.slice(trimStart);
+
+      // Enter matcher context on a `.match $var` line.
+      if (/^\.match\b/.test(trimmed) && /\$/.test(trimmed)) {
+        inMatcher = true;
+        lineStart += line.length + 1;
+        continue;
+      }
+
+      // Any other top-level declaration closes the current matcher
+      // scope — matchers can't follow more `.input` / `.local` lines.
+      if (/^\.(input|local|match)\b/.test(trimmed)) {
+        inMatcher = false;
+        lineStart += line.length + 1;
+        continue;
+      }
+
+      if (inMatcher && trimmed.startsWith("{{") && !trimmed.startsWith("{{{")) {
+        const col = trimStart;
+        errors.push({
+          startIndex: lineStart + col,
+          endIndex: lineStart + col + 2,
+          startPosition: { row, column: col },
+          endPosition: { row, column: col + 2 },
+          message:
+            "Expected a variant key before `{{…}}` — use `*` for the default " +
+            "(e.g. `* {{…}}`) or a literal like `1` / `|short|`",
+        });
+      }
+
+      lineStart += line.length + 1;
+    }
+
+    return errors;
+  }
+
+  // Semantic check for `.match` matchers: the number of keys per
+  // variant must equal the number of selectors. Tree-sitter's
+  // grammar is syntactically permissive here (variant = 1+ keys +
+  // quoted_pattern) because the key-count constraint is semantic,
+  // not syntactic. So inputs like `.match $a $b` followed by
+  // `1 {{one}}` (only one key, two selectors) parse cleanly but
+  // violate the MF2 data model.
+  //
+  // We only check matchers whose subtree has no tree-sitter errors;
+  // a broken matcher's children are unreliable and tree-sitter will
+  // already have emitted its own diagnostic.
+  function scanMatcherSemantics(rootNode) {
+    const errors = [];
+
     function walk(node) {
-      if (node.isMissing) {
-        out.push({ kind: "missing", node, message: diagnosticMessage("missing", node) });
-      } else if (node.isError) {
-        out.push({ kind: "error", node, message: diagnosticMessage("error", node) });
+      if (node.type === "matcher" && !node.hasError) {
+        const matchStmt = node.namedChildren.find((c) => c.type === "match_statement");
+        if (matchStmt) {
+          const selectorCount = matchStmt.namedChildren.filter(
+            (c) => c.type === "selector"
+          ).length;
+
+          for (const child of node.namedChildren) {
+            if (child.type !== "variant") continue;
+
+            const keys = child.namedChildren.filter((c) => c.type === "key");
+            if (keys.length === selectorCount) continue;
+
+            // Anchor the diagnostic at the first key of the offending
+            // variant — that's where the user's eye will land.
+            const target = keys[0] || child;
+            errors.push({
+              startIndex: target.startIndex,
+              endIndex: target.endIndex,
+              startPosition: target.startPosition,
+              endPosition: target.endPosition,
+              message:
+                `Wrong number of variant keys — ` +
+                `.match has ${selectorCount} ` +
+                (selectorCount === 1 ? "selector" : "selectors") +
+                `, this variant has ${keys.length} ` +
+                (keys.length === 1 ? "key" : "keys"),
+            });
+          }
+        }
       }
 
-      if (node.hasError) {
-        for (const child of node.children) walk(child);
-      }
+      for (const child of node.children) walk(child);
     }
 
     walk(rootNode);
+    return errors;
+  }
+
+  // Semantic check for undeclared variable references. MF2 allows a
+  // `$name` to come from runtime bindings without being declared, so
+  // this is technically not a syntax error — but once a message has
+  // at least one `.input` or `.local`, the convention is to declare
+  // every variable it uses. An undeclared reference in that context
+  // is almost always a typo of a declared name.
+  //
+  // Gating:
+  //   - Simple messages are always skipped (no declarations possible).
+  //   - Complex messages with zero declarations are skipped (user
+  //     chose to rely entirely on runtime bindings — no convention
+  //     to enforce).
+  //   - Otherwise, every reference not in the definitions map is
+  //     flagged with a message that explains both the typo case
+  //     and the "intentional binding" case, so users can ignore it
+  //     if they meant a binding-supplied variable.
+  function scanUndeclaredVariables(rootNode) {
+    const errors = [];
+    if (!rootNode) return errors;
+
+    const graph = buildLocalsGraph(rootNode);
+    if (!graph.scope) return errors;
+    if (graph.definitions.size === 0) return errors;
+
+    for (const ref of graph.allReferences) {
+      if (graph.definitions.has(ref.name)) continue;
+      errors.push({
+        startIndex: ref.node.startIndex,
+        endIndex: ref.node.endIndex,
+        startPosition: ref.node.startPosition,
+        endPosition: ref.node.endPosition,
+        message:
+          "`$" +
+          ref.name +
+          "` is not declared — add `.input $" +
+          ref.name +
+          "` or `.local $" +
+          ref.name +
+          " = …` above, or ignore this if it's a runtime binding",
+      });
+    }
+
+    return errors;
+  }
+
+  function collectDiagnostics(rootNode, source) {
+    const out = [];
+
+    // Syntactic diagnostics — tree-sitter's own error nodes, plus
+    // our pre-scans. Only runs when tree-sitter reports an error
+    // anywhere in the tree.
+    if (rootNode.hasError) {
+      // Pre-scans run up-front so their more specific messages take
+      // precedence. If any of them produce a hit, we treat the
+      // generic top-level "Unexpected input in message" ERROR as
+      // redundant and suppress it.
+      const braceErrors = source ? scanUnmatchedBraces(source) : [];
+      const matchSelectorErrors = source ? scanMissingMatchSelector(source) : [];
+      const variantKeyErrors = source ? scanMissingVariantKey(source) : [];
+      const haveBraceHit = braceErrors.length > 0;
+      const haveMatchHit = matchSelectorErrors.length > 0;
+      const haveVariantKeyHit = variantKeyErrors.length > 0;
+      const havePreScanHit = haveBraceHit || haveMatchHit || haveVariantKeyHit;
+
+      for (const err of braceErrors) {
+        out.push({ kind: "error", node: err, message: err.message });
+      }
+
+      for (const err of matchSelectorErrors) {
+        out.push({ kind: "error", node: err, message: err.message });
+      }
+
+      for (const err of variantKeyErrors) {
+        out.push({ kind: "error", node: err, message: err.message });
+      }
+
+      // Depth-first walk. Tree-sitter's GLR error recovery yields
+      // two flavours of broken-state node: `isMissing` for required
+      // tokens the grammar expected but didn't find, and `isError`
+      // for spans of input that couldn't be fitted to any
+      // production. We only descend when the subtree contains an
+      // error anywhere.
+      function walk(node) {
+        if (node.isMissing) {
+          out.push({ kind: "missing", node, message: diagnosticMessage("missing", node) });
+        } else if (node.isError) {
+          const parent = node.parent;
+          const isGenericTopLevel =
+            parent && TOP_LEVEL_ERROR_PARENTS.has(parent.type);
+          // Also suppress generic matcher-level ERRORs when our
+          // match-selector or variant-key pre-scan already flagged
+          // the same area — tree-sitter's fallback is redundant.
+          const isRedundantMatcherError =
+            (haveMatchHit || haveVariantKeyHit) &&
+            parent &&
+            (parent.type === "matcher" ||
+              parent.type === "match_statement" ||
+              parent.type === "variant");
+          if (!(havePreScanHit && (isGenericTopLevel || isRedundantMatcherError))) {
+            out.push({ kind: "error", node, message: diagnosticMessage("error", node) });
+          }
+        }
+
+        if (node.hasError) {
+          for (const child of node.children) walk(child);
+        }
+      }
+
+      walk(rootNode);
+    }
+
+    // Semantic diagnostics — run regardless of syntactic errors, so
+    // problems like mismatched key counts or undeclared variables
+    // surface even when the rest of the message parses cleanly.
+    for (const err of scanMatcherSemantics(rootNode)) {
+      out.push({ kind: "error", node: err, message: err.message });
+    }
+
+    for (const err of scanUndeclaredVariables(rootNode)) {
+      out.push({ kind: "error", node: err, message: err.message });
+    }
+
     return out;
   }
 
@@ -191,6 +557,7 @@
     quoted_pattern: "quoted pattern `{{ ... }}`",
     identifier: "identifier",
     key: "variant key",
+    selector: "selector (`$variable`) after `.match`",
   };
 
   const ERROR_CONTEXT = {
@@ -220,6 +587,8 @@
   function diagnosticMessage(kind, node) {
     if (kind === "missing") {
       const raw = node.type;
+      const contextMsg = contextualMissingMessage(node, raw);
+      if (contextMsg) return contextMsg;
       const nice = MISSING_NICE[raw] || `\`${raw}\``;
       return `Expected ${nice} here`;
     }
@@ -227,6 +596,49 @@
     const parent = node.parent;
     if (!parent) return "Unexpected input";
     return ERROR_CONTEXT[parent.type] || `Unexpected input in \`${parent.type}\``;
+  }
+
+  // Context-aware phrasing for MISSING tokens. The raw grammar
+  // type (`name`, `variable`, `literal`…) is semantically thin;
+  // surrounding productions tell us what the user was actually
+  // trying to write. Return a complete message or null to fall
+  // through to the default MISSING_NICE lookup.
+  function contextualMissingMessage(node, raw) {
+    if (raw !== "name" && raw !== "variable" && raw !== "literal") return null;
+
+    // Selector: `.match $count` — the variable *is* the selector.
+    if (hasAncestorOfType(node, ["selector", "match_statement"])) {
+      return "Expected a selector here (a variable like `$count`)";
+    }
+    // Variant key: the literal or `*` before a `{{…}}` in a match arm.
+    if (hasAncestorOfType(node, ["variant", "key"])) {
+      return "Expected a variant key here (a literal or `*`)";
+    }
+    // Function name: `:number`, `:date`, etc.
+    if (hasAncestorOfType(node, ["function"])) {
+      return "Expected a function name here (e.g. `:number`)";
+    }
+    // Attribute name: `@translate`, `@dir`.
+    if (hasAncestorOfType(node, ["attribute"])) {
+      return "Expected an attribute name here (e.g. `@translate`)";
+    }
+    // Option name: `style`, `minimumFractionDigits`.
+    if (hasAncestorOfType(node, ["option"])) {
+      return "Expected an option name here (e.g. `style`)";
+    }
+    return null;
+  }
+
+  // Walk up the parent chain and return true if any ancestor has
+  // one of the given types. Used for context-aware phrasing of
+  // diagnostics.
+  function hasAncestorOfType(node, types) {
+    let p = node.parent;
+    while (p) {
+      if (types.includes(p.type)) return true;
+      p = p.parent;
+    }
+    return false;
   }
 
   // Paint returns byte → diagnostic-index-or-undefined. The caller
@@ -1915,7 +2327,7 @@
       // Report diagnostics to any interested host. Consumers listen
       // on the editor element for 'mf2-diagnostics'. Detail is an
       // array of `{kind, startByte, endByte, startPoint, endPoint, message}`.
-      const diagnostics = collectDiagnostics(tree.rootNode);
+      const diagnostics = collectDiagnostics(tree.rootNode, source);
       const payload = diagnostics.map(({ kind, node, message }) => ({
         kind,
         startByte: node.startIndex,
@@ -1936,7 +2348,7 @@
       if (!this.tree || !this.highlightQuery) return;
       const source = this.textarea.value;
       const root = this.tree.rootNode;
-      const diagnostics = collectDiagnostics(root);
+      const diagnostics = collectDiagnostics(root, source);
       const captures = this.highlightQuery.captures(root);
       const html = buildHtml(source, captures, diagnostics, this.matchedBytes);
       this.pre.innerHTML = html;

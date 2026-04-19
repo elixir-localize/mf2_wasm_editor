@@ -1,54 +1,73 @@
 defmodule Mix.Tasks.Mf2WasmEditor.Sync do
   @moduledoc """
-  Sync the vendored grammar + WASM + queries from the
-  [`mf2_treesitter`](https://github.com/elixir-localize/mf2_treesitter)
-  repo.
+  Sync the vendored grammar + WASM + queries from the published
+  [`tree-sitter-mf2`](https://www.npmjs.com/package/tree-sitter-mf2)
+  npm package.
 
   This package embeds the MF2 grammar as browser-facing artefacts:
 
     * **WASM** (`priv/static/tree-sitter-mf2.wasm`) — what the
       `web-tree-sitter` runtime actually loads.
 
-    * **Queries** (`priv/static/highlights.scm`, `injections.scm`)
-      — fetched at runtime by the JS hook.
+    * **Queries** (`priv/static/highlights.scm`) — fetched at
+      runtime by the JS hook.
 
     * **Grammar source** (`priv/grammar/`) — parser.c, parser.h,
-      grammar.json, node-types.json, grammar.js. Kept alongside as
-      reference so the WASM can be regenerated locally if needed.
+      grammar.json, node-types.json, grammar.js. Kept alongside so
+      the WASM can be regenerated locally with `--build-wasm`.
 
-  The canonical source for all three lives in `mf2_treesitter`.
-  This task keeps our vendored copy in step.
+  The canonical source is the npm package, pinned to an exact
+  version at the top of this module (`@tree_sitter_mf2_version`).
+  Bump that string and re-run the task to move to a new grammar
+  release. Keep the pin in step with `localize_mf2_treesitter`'s
+  own sync task — tree shape is the API boundary between
+  server-side parse (NIF) and browser-side parse (WASM editor); a
+  version skew can produce different trees for the same input.
 
   ## Usage
 
-      # Copy sources + queries + WASM from the sibling mf2_treesitter.
+      # Fetch from npm at the pinned version and update local files.
       mix mf2_wasm_editor.sync
 
-      # Fail (exit 1) if anything has drifted; do not modify files.
-      # Intended for CI.
+      # Fail (exit 1) if anything has drifted from the pinned
+      # version; do not modify files. Intended for CI.
       mix mf2_wasm_editor.sync --check
 
       # Additionally rebuild priv/static/tree-sitter-mf2.wasm from
-      # the vendored grammar (rather than just copying the grammar
-      # repo's prebuilt .wasm). Requires emcc, docker, or podman on
-      # PATH; uses the tree-sitter CLI under node_modules/.bin of
-      # mf2_treesitter.
+      # the vendored grammar instead of using the prebuilt .wasm
+      # shipped in the npm tarball. Requires a local `mf2_treesitter`
+      # checkout (via MF2_TREESITTER_DIR) with `npm install` already
+      # run, plus emcc / docker / podman on PATH.
       mix mf2_wasm_editor.sync --build-wasm
 
-  ## Locating the grammar repo
+  ## Offline / local-iteration override
 
-  The task looks for `mf2_treesitter` at `../mf2_treesitter` relative
-  to this package. Override with `MF2_TREESITTER_DIR`:
+  If you're iterating on the grammar locally and want this task to
+  read from a sibling checkout rather than hit the network, set
+  `MF2_TREESITTER_DIR`:
 
       MF2_TREESITTER_DIR=/path/to/mf2_treesitter mix mf2_wasm_editor.sync
+
+  With that set, file layouts must match the npm package layout
+  (which also matches the repo layout): `grammar.js` at the root,
+  `src/parser.c`, `queries/highlights.scm`, `wasm/tree-sitter-mf2.wasm`.
   """
   use Mix.Task
 
-  @shortdoc "Sync the vendored tree-sitter-mf2 grammar + WASM + queries from mf2_treesitter."
+  @shortdoc "Sync the vendored tree-sitter-mf2 grammar + WASM + queries from npm."
 
-  # Files to sync from mf2_treesitter. Each tuple is `{source_rel, dest_rel}`
-  # — source relative to the mf2_treesitter repo root, dest relative to
-  # this package's priv/ directory.
+  # Pinned tree-sitter-mf2 version. Bump and re-run the task to
+  # pull a newer grammar.
+  @tree_sitter_mf2_version "0.1.4"
+
+  # unpkg.com proxies the npm registry and serves individual files
+  # from a package tarball over HTTPS at stable URLs. The only
+  # requirement is that the package has actually been published.
+  @cdn_base "https://unpkg.com/tree-sitter-mf2@#{@tree_sitter_mf2_version}"
+
+  # Files to sync. Each tuple is `{source_rel, dest_rel}` — source
+  # relative to the package root (same under both npm and the repo),
+  # dest relative to this package's priv/ directory.
   @grammar_files [
     {"grammar.js", "grammar/grammar.js"},
     {"src/grammar.json", "grammar/src/grammar.json"},
@@ -62,9 +81,6 @@ defmodule Mix.Tasks.Mf2WasmEditor.Sync do
   ]
 
   @wasm_files [
-    # mf2_treesitter ships a prebuilt .wasm; copy it verbatim into
-    # priv/static/ so we don't need emscripten/docker on consumers'
-    # machines. Override via --build-wasm.
     {"wasm/tree-sitter-mf2.wasm", "static/tree-sitter-mf2.wasm"}
   ]
 
@@ -77,10 +93,17 @@ defmodule Mix.Tasks.Mf2WasmEditor.Sync do
     check? = opts[:check] == true
     build_wasm? = opts[:build_wasm] == true
 
-    grammar_dir = grammar_dir!()
+    source = resolve_source()
     priv_dir = priv_dir()
 
-    Mix.shell().info("[sync] grammar source: #{grammar_dir}")
+    case source do
+      {:cdn, base} ->
+        Mix.shell().info("[sync] grammar source: #{base}")
+
+      {:local, path} ->
+        Mix.shell().info("[sync] grammar source: #{path} (local override)")
+    end
+
     Mix.shell().info("[sync] package priv:   #{priv_dir}")
 
     files_to_sync = @grammar_files ++ @query_files
@@ -90,7 +113,7 @@ defmodule Mix.Tasks.Mf2WasmEditor.Sync do
     files_to_sync =
       if build_wasm?, do: files_to_sync, else: files_to_sync ++ @wasm_files
 
-    drift = sync_files(grammar_dir, priv_dir, files_to_sync, check?)
+    drift = sync_files(source, priv_dir, files_to_sync, check?)
 
     cond do
       check? and drift != [] ->
@@ -104,7 +127,9 @@ defmodule Mix.Tasks.Mf2WasmEditor.Sync do
         exit({:shutdown, 1})
 
       check? ->
-        Mix.shell().info("[sync] check: all vendored files match the source repo.")
+        Mix.shell().info(
+          "[sync] check: all vendored files match tree-sitter-mf2@#{@tree_sitter_mf2_version}."
+        )
 
       drift == [] ->
         Mix.shell().info("[sync] already in sync; no files changed.")
@@ -113,26 +138,20 @@ defmodule Mix.Tasks.Mf2WasmEditor.Sync do
         Mix.shell().info("[sync] updated #{length(drift)} file(s).")
     end
 
-    if build_wasm? do
-      build_wasm(grammar_dir, priv_dir)
-    end
+    if build_wasm?, do: build_wasm(priv_dir)
 
     :ok
   end
 
-  defp sync_files(src_root, dst_root, pairs, check?) do
+  defp sync_files(source, dst_root, pairs, check?) do
     Enum.reduce(pairs, [], fn {src_rel, dst_rel}, acc ->
-      src_path = Path.join(src_root, src_rel)
+      bytes = fetch_bytes!(source, src_rel)
       dst_path = Path.join(dst_root, dst_rel)
 
-      unless File.exists?(src_path) do
-        Mix.raise("missing source file: #{src_path}")
-      end
-
-      if changed?(src_path, dst_path) do
+      if changed?(bytes, dst_path) do
         unless check? do
           File.mkdir_p!(Path.dirname(dst_path))
-          File.cp!(src_path, dst_path)
+          File.write!(dst_path, bytes)
           Mix.shell().info("[sync] wrote #{dst_rel}")
         end
 
@@ -143,15 +162,79 @@ defmodule Mix.Tasks.Mf2WasmEditor.Sync do
     end)
   end
 
-  defp changed?(src, dst) do
+  defp changed?(new_bytes, dst) do
     cond do
       not File.exists?(dst) -> true
-      File.read!(src) != File.read!(dst) -> true
+      File.read!(dst) != new_bytes -> true
       true -> false
     end
   end
 
-  defp build_wasm(grammar_dir, priv_dir) do
+  # Fetch the raw bytes for one file under the grammar package root.
+  # Dispatches on source kind — local checkout copies from disk,
+  # CDN mode does a verified HTTPS GET.
+  defp fetch_bytes!({:local, dir}, rel) do
+    path = Path.join(dir, rel)
+
+    unless File.exists?(path) do
+      Mix.raise("missing source file at local override: #{path}")
+    end
+
+    File.read!(path)
+  end
+
+  defp fetch_bytes!({:cdn, base}, rel) do
+    url = "#{base}/#{rel}"
+    http_get!(url)
+  end
+
+  defp http_get!(url) do
+    ensure_http_started()
+
+    url_charlist = String.to_charlist(url)
+    request = {url_charlist, [{~c"accept", ~c"*/*"}]}
+
+    case :httpc.request(:get, request, [ssl: ssl_options()], body_format: :binary) do
+      {:ok, {{_http, status, _reason}, _headers, body}} when status in 200..299 ->
+        body
+
+      {:ok, {{_http, status, reason}, _headers, _body}} ->
+        Mix.raise("""
+        HTTP #{status} #{reason} from #{url}
+
+        Check that tree-sitter-mf2@#{@tree_sitter_mf2_version} exists on npm
+        (https://www.npmjs.com/package/tree-sitter-mf2), or set
+        MF2_TREESITTER_DIR to a local checkout to bypass the CDN.
+        """)
+
+      {:error, reason} ->
+        Mix.raise("""
+        HTTP request to #{url} failed: #{inspect(reason)}
+
+        Check your network connection, or set MF2_TREESITTER_DIR to a
+        local checkout to bypass the CDN.
+        """)
+    end
+  end
+
+  defp ensure_http_started do
+    :ssl.start()
+    :inets.start()
+  end
+
+  defp ssl_options do
+    [
+      verify: :verify_peer,
+      cacerts: :public_key.cacerts_get(),
+      customize_hostname_check: [
+        match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+      ]
+    ]
+  end
+
+  defp build_wasm(priv_dir) do
+    grammar_dir = local_checkout_path!("--build-wasm requires a local mf2_treesitter checkout")
+
     tree_sitter_bin = Path.join([grammar_dir, "node_modules", ".bin", "tree-sitter"])
 
     unless File.exists?(tree_sitter_bin) do
@@ -184,25 +267,47 @@ defmodule Mix.Tasks.Mf2WasmEditor.Sync do
     end
   end
 
-  defp grammar_dir! do
-    override = System.get_env("MF2_TREESITTER_DIR")
+  # Returns the source to read files from:
+  #   {:local, path} when MF2_TREESITTER_DIR is set (local iteration)
+  #   {:cdn, base_url} otherwise (the default, reproducible path)
+  defp resolve_source do
+    case System.get_env("MF2_TREESITTER_DIR") do
+      nil ->
+        {:cdn, @cdn_base}
 
-    path =
-      cond do
-        is_binary(override) and override != "" -> override
-        true -> Path.expand("../mf2_treesitter", File.cwd!())
-      end
+      "" ->
+        {:cdn, @cdn_base}
 
-    unless File.dir?(path) do
-      Mix.raise("""
-      mf2_treesitter not found at: #{path}
+      override ->
+        path = Path.expand(override)
 
-      Set MF2_TREESITTER_DIR to the mf2_treesitter repo, or check
-      it out as a sibling of this package.
-      """)
+        unless File.dir?(path) do
+          Mix.raise("MF2_TREESITTER_DIR set but not a directory: #{path}")
+        end
+
+        {:local, path}
     end
+  end
 
-    path
+  # --build-wasm specifically needs a local checkout; the npm
+  # tarball doesn't ship the compiled tree-sitter CLI.
+  defp local_checkout_path!(message) do
+    case System.get_env("MF2_TREESITTER_DIR") do
+      nil ->
+        Mix.raise(message <> " — set MF2_TREESITTER_DIR=/path/to/mf2_treesitter.")
+
+      "" ->
+        Mix.raise(message <> " — set MF2_TREESITTER_DIR=/path/to/mf2_treesitter.")
+
+      override ->
+        path = Path.expand(override)
+
+        unless File.dir?(path) do
+          Mix.raise("MF2_TREESITTER_DIR set but not a directory: #{path}")
+        end
+
+        path
+    end
   end
 
   defp priv_dir do

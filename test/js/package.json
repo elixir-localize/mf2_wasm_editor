@@ -1,0 +1,13 @@
+{
+  "name": "mf2-wasm-editor-js-tests",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Node-run integration tests for the browser-side hook. Not shipped in the hex package.",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "web-tree-sitter": "0.26.8"
+  }
+}

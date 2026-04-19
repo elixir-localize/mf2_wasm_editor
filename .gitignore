@@ -11,3 +11,7 @@ erl_crash.dump
 # under priv/static/ and priv/grammar/; local/temporary files must
 # not leak into the package.
 /tmp/
+
+# Node-based JS integration tests live under test/js/ and pull npm
+# devDeps on first run. The lockfile is committed; node_modules is not.
+/test/js/node_modules/

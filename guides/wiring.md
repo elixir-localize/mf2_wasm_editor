@@ -25,12 +25,14 @@ The `:only` option scopes `Plug.Static` to the six files the hook needs; nothing
 
 ```heex
 <link phx-track-static rel="stylesheet" href="/assets/app.css" />
-<%!-- MF2 editor scripts MUST appear before app.js (see below). --%>
+<%!-- MF2 editor script MUST appear before app.js (see below). --%>
 {raw(Mf2WasmEditor.script_tags())}
 <script defer phx-track-static type="text/javascript" src="/assets/app.js"></script>
 ```
 
-**`script_tags/1` must come before `app.js` in the document.** Both sets of scripts use `defer`, which runs them in document order after parsing finishes. `app.js` constructs the `LiveSocket` and reads `window.Mf2WasmEditor.Hooks.MF2Editor` at that moment — so the MF2 scripts must have executed first and populated the namespace. Put them after `app.js` and the hook is silently unregistered; the editor mounts with no hook bound and you get the full **cursor moves but nothing highlights** failure mode. This is a very easy mistake to make; there is no runtime error.
+`script_tags/1` emits a single `<script type="module" src="/mf2_editor/mf2_editor.js">` tag. The hook is an ES module that imports `web-tree-sitter` from the neighbouring file, so there's no separate runtime loader — one tag, one load.
+
+**The MF2 tag must come before `app.js` in the document.** ES modules are deferred by default, so they evaluate in document order after parsing finishes — matching the explicit `defer` on `app.js`. `app.js` constructs the `LiveSocket` and reads `window.Mf2WasmEditor.Hooks.MF2Editor` at that moment; the MF2 module must have evaluated first and populated the namespace. Put it after `app.js` and the hook is silently unregistered; the editor mounts with no hook bound and you get the full **cursor moves but nothing highlights** failure mode. No runtime error.
 
 If you pass a custom base URL:
 
@@ -38,7 +40,7 @@ If you pass a custom base URL:
 {raw(Mf2WasmEditor.script_tags(base_url: "/assets/mf2"))}
 ```
 
-The hook's runtime asset fetches (`tree-sitter.wasm`, `tree-sitter-mf2.wasm`, `highlights.scm`) are derived from the same base URL via `window.Mf2WasmEditor.baseUrl` (set by the `<script>` preamble) or a `data-mf2-base-url` attribute on the hook element.
+The hook's runtime asset fetches (`web-tree-sitter.wasm`, `tree-sitter-mf2.wasm`, `highlights.scm`) are derived from the same base URL via `window.Mf2WasmEditor.baseUrl` (set at module-evaluation time) or a `data-mf2-base-url` attribute on the hook element.
 
 ### 3. Merge the hook into your `LiveSocket`
 
@@ -93,7 +95,7 @@ The rest of this guide is a catalogue of sharp edges that *will* bite you if you
 
 ### Script load order is load-bearing
 
-Both `tree-sitter.js` and `mf2_editor.js` must be loaded and parsed before `app.js`'s `defer` callback runs. The default `script_tags/1` output is correct **only if you place the call to `script_tags/1` before the `<script>` tag for your `app.js`**. See step 2 above.
+`mf2_editor.js` (an ES module that imports `web-tree-sitter`) must be loaded and parsed before `app.js`'s deferred callback runs. The default `script_tags/1` output is correct **only if you place the call to `script_tags/1` before the `<script>` tag for your `app.js`**. See step 2 above.
 
 Symptom if violated: hook never mounts, typing works natively (the textarea accepts input) but the `<pre>` never repaints. Typically no console errors.
 
@@ -299,7 +301,8 @@ If the editor isn't working, these are the failure modes and how to identify eac
 The hook never mounted. Check the DevTools console:
 
 - If there's no `LiveView` chatter about your hook and no errors, the hook isn't registered on the `LiveSocket` — usually a script load-order issue. See Wiring step 2.
-- If there's a `ReferenceError: TreeSitter is not defined`, `tree-sitter.js` didn't load — usually a `Plug.Static` misconfiguration.
+- If DevTools' Network tab shows `web-tree-sitter.js` or `web-tree-sitter.wasm` as 404, the `Plug.Static` declaration is misconfigured — check the `:only` list matches `Mf2WasmEditor.static_paths()`.
+- If the Console shows `SyntaxError: Bad syntax at offset N` during `language.query(...)`, the vendored `web-tree-sitter.wasm` runtime is out of step with the `tree-sitter-mf2.wasm` grammar's ABI. Bump `mf2_wasm_editor`; the runtime and grammar ship together.
 
 ### "It worked once, now typing produces stale state"
 

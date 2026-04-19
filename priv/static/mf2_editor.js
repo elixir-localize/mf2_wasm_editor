@@ -1,5 +1,5 @@
 /*
- * localize_mf2_editor — browser-side MF2 syntax highlighter.
+ * mf2_wasm_editor — browser-side MF2 syntax highlighter.
  *
  * Ships a Phoenix LiveView hook (`MF2Editor`) that runs the
  * tree-sitter-mf2 grammar directly in the browser via
@@ -7,14 +7,21 @@
  * or diagnostics — server round trips are reserved for formatting
  * (`Localize.Message.format/3`) and other authoritative operations.
  *
- * Load order
- * ----------
+ * Loading
+ * -------
  *
- *   <script src="/mf2_editor/tree-sitter.js"></script>
- *   <script src="/mf2_editor/mf2_editor.js"></script>
+ * This file is an ES module. The root layout emits a single
+ * `<script type="module" src="/mf2_editor/mf2_editor.js">` tag (see
+ * `Mf2WasmEditor.script_tags/1`). The module imports web-tree-sitter
+ * directly from the neighbouring `web-tree-sitter.js` — no separate
+ * loader script, no global pollution.
  *
- * After these load, `window.Mf2WasmEditor.Hooks.MF2Editor` is the
- * LiveView hook. Merge it into your LiveSocket's `hooks` option.
+ * After the module evaluates, `window.Mf2WasmEditor.Hooks.MF2Editor`
+ * is the LiveView hook. Merge it into your LiveSocket's `hooks`
+ * option in your app.js:
+ *
+ *     const Hooks = Object.assign({}, window.Mf2WasmEditor?.Hooks || {});
+ *     new LiveSocket("/live", Socket, { hooks: Hooks, ... });
  *
  * Expected DOM
  * ------------
@@ -37,37 +44,36 @@
  * attribute on the hook element.
  */
 
-(function () {
-  const DEFAULT_BASE_URL = "/mf2_editor";
+import { Parser, Language, Query } from "./web-tree-sitter.js";
 
-  const ns = (window.Mf2WasmEditor = window.Mf2WasmEditor || {});
-  ns.baseUrl = ns.baseUrl || DEFAULT_BASE_URL;
+const DEFAULT_BASE_URL = "/mf2_editor";
 
-  // ------------------------------------------------------------------
-  // One-time page-wide initialisation of the tree-sitter runtime,
-  // grammar, and highlight query. Cached on the namespace so multiple
-  // editor instances share a single Parser.Language and Query.
-  // ------------------------------------------------------------------
+const ns = (window.Mf2WasmEditor = window.Mf2WasmEditor || {});
+ns.baseUrl = ns.baseUrl || DEFAULT_BASE_URL;
 
-  let initPromise = null;
+// ------------------------------------------------------------------
+// One-time page-wide initialisation of the tree-sitter runtime,
+// grammar, and highlight query. Cached on the namespace so multiple
+// editor instances share a single Language and Query.
+// ------------------------------------------------------------------
 
-  function initialize(baseUrl) {
-    if (initPromise) return initPromise;
+let initPromise = null;
 
-    initPromise = (async () => {
-      if (typeof TreeSitter === "undefined") {
-        throw new Error(
-          "MF2 editor: tree-sitter.js must be loaded before mf2_editor.js"
-        );
-      }
+function initialize(baseUrl) {
+  if (initPromise) return initPromise;
 
-      await TreeSitter.init({
-        locateFile: (path) => `${baseUrl}/${path}`,
-      });
+  initPromise = (async () => {
+    // The runtime is loaded as an ES module, so Parser / Language
+    // are directly available. Parser.init() still pulls the
+    // web-tree-sitter WASM; point locateFile at our baseUrl so
+    // the runtime WASM resolves next to this script.
+    await Parser.init({
+      locateFile: (path) => `${baseUrl}/${path}`,
+    });
 
-      const language = await TreeSitter.Language.load(
-        `${baseUrl}/tree-sitter-mf2.wasm`
-      );
+    const language = await Language.load(
+      `${baseUrl}/tree-sitter-mf2.wasm`
+    );
 
       const highlightsSource = await fetch(`${baseUrl}/highlights.scm`).then(
         (r) => {
@@ -80,7 +86,9 @@
         }
       );
 
-      const highlightQuery = language.query(highlightsSource);
+      // web-tree-sitter 0.26+ query API: `new Query(language, source)`
+      // replaces the older `language.query(source)`.
+      const highlightQuery = new Query(language, highlightsSource);
 
       return { language, highlightQuery };
     })();
@@ -1635,7 +1643,7 @@
         return;
       }
 
-      this.parser = new TreeSitter();
+      this.parser = new Parser();
       this.parser.setLanguage(this.language);
 
       this.onInput = () => this.update();
@@ -2358,4 +2366,3 @@
   ns.Hooks = ns.Hooks || {};
   ns.Hooks.MF2Editor = MF2Editor;
   ns.buildHtml = buildHtml; // exposed for SSR parity tests
-})();

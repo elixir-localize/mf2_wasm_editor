@@ -4,17 +4,15 @@ defmodule Mf2WasmEditor do
 
   Ships three things:
 
-    * The web-tree-sitter runtime (`tree-sitter.js`, `tree-sitter.wasm`).
+    * The web-tree-sitter runtime (`web-tree-sitter.js` + `.wasm`).
     * The compiled `tree-sitter-mf2` grammar (`tree-sitter-mf2.wasm`).
     * A Phoenix LiveView hook (`mf2_editor.js`) that wires a
       transparent textarea + highlighted `<pre>` into the grammar,
       highlighting and surfacing diagnostics on every keystroke —
       with no server round trip.
 
-  The assets live under `priv/static/` inside this package. Consumers
-  serve them as-is via `Plug.Static` (or equivalent) and include them
-  with two `<script>` tags. See `script_tags/1` for the canonical
-  markup and `Plug.Static` configuration snippet in the README.
+  The hook is an ES module that imports web-tree-sitter directly.
+  One `<script type="module">` tag loads both.
 
   ## Wiring up a host app
 
@@ -47,10 +45,15 @@ defmodule Mf2WasmEditor do
   """
 
   @doc """
-  Emit the two `<script>` tags needed to load the editor.
+  Emit the `<script>` tag needed to load the editor.
 
   The output is a raw HTML string. In a HEEx template wrap with
   `Phoenix.HTML.raw/1` (or `{raw(...)}` in HEEx 1.1+).
+
+  The emitted tag uses `type="module"` because `mf2_editor.js` is an
+  ES module that imports web-tree-sitter directly. There is no
+  longer a separate runtime loader script — the module handles
+  loading the runtime as part of its own import graph.
 
   ### Options
 
@@ -61,20 +64,17 @@ defmodule Mf2WasmEditor do
   ### Examples
 
       iex> Mf2WasmEditor.script_tags()
-      ~s(<script src="/mf2_editor/tree-sitter.js" defer></script>\\n) <>
-        ~s(<script src="/mf2_editor/mf2_editor.js" defer></script>)
+      ~s(<script type="module" src="/mf2_editor/mf2_editor.js"></script>)
 
       iex> Mf2WasmEditor.script_tags(base_url: "/assets/mf2")
-      ~s(<script src="/assets/mf2/tree-sitter.js" defer></script>\\n) <>
-        ~s(<script src="/assets/mf2/mf2_editor.js" defer></script>)
+      ~s(<script type="module" src="/assets/mf2/mf2_editor.js"></script>)
 
   """
   @spec script_tags(keyword()) :: binary()
   def script_tags(options \\ []) do
     base_url = Keyword.get(options, :base_url, "/mf2_editor")
 
-    ~s(<script src="#{base_url}/tree-sitter.js" defer></script>\n) <>
-      ~s(<script src="#{base_url}/mf2_editor.js" defer></script>)
+    ~s(<script type="module" src="#{base_url}/mf2_editor.js"></script>)
   end
 
   @doc """
@@ -86,12 +86,12 @@ defmodule Mf2WasmEditor do
 
       iex> Mf2WasmEditor.static_paths()
       ["highlights.scm", "mf2_editor.js", "tree-sitter-mf2.wasm",
-       "tree-sitter.js", "tree-sitter.wasm"]
+       "web-tree-sitter.js", "web-tree-sitter.wasm"]
 
   """
   @spec static_paths() :: [String.t()]
   def static_paths do
     ~w(highlights.scm mf2_editor.js tree-sitter-mf2.wasm
-       tree-sitter.js tree-sitter.wasm)
+       web-tree-sitter.js web-tree-sitter.wasm)
   end
 end

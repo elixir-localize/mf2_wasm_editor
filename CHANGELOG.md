@@ -2,26 +2,11 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versioning follows [Semantic Versioning](https://semver.org/).
 
-## [0.2.0] — unreleased
+## [0.2.0] — April 19th, 2026
 
 ### Breaking change
 
-The hook is now loaded as an ES module that imports `web-tree-sitter` directly. This replaces the two-script model used in 0.1.0 (a global `TreeSitter` loader plus the hook script). Consequences for consumers upgrading from 0.1.0:
-
-* **One `<script>` tag, not two.** `Mf2WasmEditor.script_tags/1` now emits a single `<script type="module" src=".../mf2_editor.js">`. Re-render your root layout — no code change if you call `script_tags/1`.
-
-* **Vendored filenames changed.** The web-tree-sitter runtime is now `web-tree-sitter.js` + `web-tree-sitter.wasm` (matching upstream npm naming) instead of `tree-sitter.js` + `tree-sitter.wasm`. If your `Plug.Static` declaration pins `:only` to the literal file list, replace it with `Mf2WasmEditor.static_paths()` which tracks the package.
-
-* **No more `window.TreeSitter`.** The hook imports `Parser` and `Language` as ES-module named exports. Host code shouldn't touch the runtime directly, but if it did, switch to `import { Parser, Language } from "/mf2_editor/web-tree-sitter.js"`.
-
-### Why
-
-The 0.1.0 runtime (web-tree-sitter 0.24.x) couldn't parse queries compiled against the grammar shipped in the same release (`tree-sitter-mf2@0.1.4`, built with tree-sitter CLI 0.26.x → ABI 15). The runtime bundled in 0.1.0 only supported the ABI-14 query format, so `language.query(highlightsSource)` threw `SyntaxError: Bad syntax at offset 14` and the editor never mounted. Bumping the runtime to 0.26.8 required moving to its ES-module distribution — hence the loader-model change.
-
-### Runtime / grammar versions
-
-* web-tree-sitter: **0.26.8** (was 0.24.x).
-* tree-sitter-mf2 grammar: unchanged — `tree-sitter-mf2@0.1.4` as in 0.1.0.
+The hook is now loaded as an ES module that imports `web-tree-sitter` directly. This replaces the two-script model used in 0.1.0 (a global `TreeSitter` loader plus the hook script).
 
 ## [0.1.0] — April 19th, 2026
 
